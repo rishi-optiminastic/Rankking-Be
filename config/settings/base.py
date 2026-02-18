@@ -19,6 +19,7 @@ INSTALLED_APPS = [
     
    'apps.accounts.apps.AccountsConfig',
     'apps.organizations.apps.OrganizationsConfig',
+    'apps.analyzer.apps.AnalyzerConfig',
     'core',
 ]
 
