@@ -10,11 +10,15 @@ from .utils import extract_internal_links, extract_text
 
 logger = logging.getLogger("apps")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-TIMEOUT = 5
+# Rotate user agents to reduce blocking
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+TIMEOUT = 15
+MAX_RETRIES = 2
 
 
 @dataclass
@@ -39,34 +43,67 @@ def crawl_page(url: str) -> CrawlResult:
     parsed = urlparse(url)
     result.is_https = parsed.scheme == "https"
 
-    try:
-        start = time.time()
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=TIMEOUT,
-            allow_redirects=True,
-        )
-        result.load_time = time.time() - start
-        result.status_code = resp.status_code
+    last_error = ""
 
-        if resp.status_code != 200:
+    for attempt in range(MAX_RETRIES + 1):
+        ua = USER_AGENTS[attempt % len(USER_AGENTS)]
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        try:
+            start = time.time()
+            resp = requests.get(
+                url,
+                headers=headers,
+                timeout=TIMEOUT,
+                allow_redirects=True,
+            )
+            result.load_time = time.time() - start
+            result.status_code = resp.status_code
+
+            if resp.status_code == 200:
+                result.html = resp.text
+                result.soup = BeautifulSoup(resp.text, "html.parser")
+                text_soup = BeautifulSoup(resp.text, "html.parser")
+                result.text = extract_text(text_soup)
+                result.internal_links = extract_internal_links(result.soup, url)
+                return result
+
+            # Retry on server errors (5xx) or rate limiting (429)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_error = f"HTTP {resp.status_code}"
+                logger.info("Crawl attempt %d/%d got %d for %s, retrying...",
+                            attempt + 1, MAX_RETRIES + 1, resp.status_code, url)
+                time.sleep(2 * (attempt + 1))  # Backoff: 2s, 4s
+                continue
+
+            # Non-retryable HTTP error (403, 404, etc.)
             result.error = f"HTTP {resp.status_code}"
             return result
 
-        result.html = resp.text
-        result.soup = BeautifulSoup(resp.text, "html.parser")
-        text_soup = BeautifulSoup(resp.text, "html.parser")
-        result.text = extract_text(text_soup)
-        result.internal_links = extract_internal_links(result.soup, url)
+        except requests.Timeout:
+            last_error = "Request timed out"
+            logger.info("Crawl attempt %d/%d timed out for %s", attempt + 1, MAX_RETRIES + 1, url)
+            time.sleep(1)
+            continue
+        except requests.ConnectionError as exc:
+            last_error = f"Connection error: {exc}"
+            logger.info("Crawl attempt %d/%d connection error for %s", attempt + 1, MAX_RETRIES + 1, url)
+            time.sleep(1)
+            continue
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            logger.warning("Crawl error for %s: %s", url, exc)
+            break
 
-    except requests.Timeout:
-        result.error = "Request timed out"
-        logger.warning("Crawl timeout: %s", url)
-    except requests.RequestException as exc:
-        result.error = str(exc)
-        logger.warning("Crawl error for %s: %s", url, exc)
-
+    # All retries exhausted
+    result.error = last_error
     return result
 
 
@@ -75,7 +112,10 @@ def check_file_exists(base_url: str, path: str) -> bool:
     url = f"{parsed.scheme}://{parsed.netloc}/{path.lstrip('/')}"
     try:
         resp = requests.head(
-            url, headers={"User-Agent": USER_AGENT}, timeout=3, allow_redirects=True
+            url,
+            headers={"User-Agent": USER_AGENTS[0]},
+            timeout=5,
+            allow_redirects=True,
         )
         return resp.status_code == 200
     except requests.RequestException:
@@ -87,7 +127,10 @@ def fetch_file_content(base_url: str, path: str) -> str:
     url = f"{parsed.scheme}://{parsed.netloc}/{path.lstrip('/')}"
     try:
         resp = requests.get(
-            url, headers={"User-Agent": USER_AGENT}, timeout=3, allow_redirects=True
+            url,
+            headers={"User-Agent": USER_AGENTS[0]},
+            timeout=5,
+            allow_redirects=True,
         )
         if resp.status_code == 200:
             return resp.text

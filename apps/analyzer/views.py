@@ -90,6 +90,7 @@ class AnalysisRunDetailView(APIView):
 
 class AnalysisRunStatusView(APIView):
     permission_classes = [AllowAny]
+    throttle_classes = []  # No throttling — this is a polling endpoint
 
     def get(self, request, run_id):
         try:

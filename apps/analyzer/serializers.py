@@ -68,6 +68,7 @@ class AnalysisRunDetailSerializer(serializers.ModelSerializer):
             "id", "url", "email", "run_type", "status", "progress",
             "composite_score", "error_message", "created_at", "updated_at",
             "page_scores", "competitors", "recommendations", "ai_probes",
+            "llm_logs",
         ]
 
 

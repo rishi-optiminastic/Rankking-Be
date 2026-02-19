@@ -15,7 +15,7 @@ AI_BOT_AGENTS = [
 def _check_robots_allows_ai(robots_txt: str) -> tuple[bool, list[str]]:
     blocked = []
     if not robots_txt:
-        return True, []  # No robots.txt = allow all
+        return True, []
 
     lines = robots_txt.lower().splitlines()
     current_agent = None
@@ -35,12 +35,18 @@ def _check_robots_allows_ai(robots_txt: str) -> tuple[bool, list[str]]:
 
 
 def score_technical(crawl: CrawlResult) -> tuple[float, dict]:
-    if not crawl.ok:
-        return 0.0, {"error": crawl.error}
-
+    """
+    Score technical GEO signals.
+    Works even if crawl failed — file checks (llms.txt, robots.txt, sitemap)
+    and URL-level checks (HTTPS) don't require page HTML.
+    """
+    has_html = crawl.ok
     soup = crawl.soup
+
     details = {"checks": {}, "findings": []}
     score = 0.0
+
+    # ── Checks that work WITHOUT page HTML ────────────────────────────
 
     # llms.txt exists (20 pts)
     has_llms_txt = check_file_exists(crawl.url, "llms.txt")
@@ -63,7 +69,7 @@ def score_technical(crawl: CrawlResult) -> tuple[float, dict]:
         else:
             details["findings"].append("ai_bots_blocked")
     else:
-        score += 20  # No robots.txt = allow all
+        score += 20
         details["checks"]["ai_bots_allowed"] = True
 
     # sitemap.xml (10 pts)
@@ -74,17 +80,6 @@ def score_technical(crawl: CrawlResult) -> tuple[float, dict]:
     else:
         details["findings"].append("no_sitemap")
 
-    # Meta robots ok (10 pts)
-    meta_robots = soup.find("meta", attrs={"name": "robots"})
-    robots_content = meta_robots.get("content", "").lower() if meta_robots else ""
-    noindex = "noindex" in robots_content
-    nofollow = "nofollow" in robots_content
-    details["checks"]["meta_robots_ok"] = not noindex
-    if not noindex:
-        score += 10
-    else:
-        details["findings"].append("meta_noindex")
-
     # HTTPS (5 pts)
     details["checks"]["is_https"] = crawl.is_https
     if crawl.is_https:
@@ -92,32 +87,57 @@ def score_technical(crawl: CrawlResult) -> tuple[float, dict]:
     else:
         details["findings"].append("no_https")
 
-    # Load time < 3s (15 pts)
-    details["checks"]["load_time"] = round(crawl.load_time, 2)
-    if crawl.load_time < 1.5:
-        score += 15
-    elif crawl.load_time < 3.0:
-        score += 10
-    elif crawl.load_time < 5.0:
-        score += 5
+    # Load time (15 pts) — use whatever we got, even from a failed request
+    if crawl.load_time > 0:
+        details["checks"]["load_time"] = round(crawl.load_time, 2)
+        if crawl.load_time < 1.5:
+            score += 15
+        elif crawl.load_time < 3.0:
+            score += 10
+        elif crawl.load_time < 5.0:
+            score += 5
+        else:
+            details["findings"].append("slow_load_time")
     else:
-        details["findings"].append("slow_load_time")
+        details["checks"]["load_time"] = None
 
-    # Viewport meta (10 pts)
-    viewport = soup.find("meta", attrs={"name": "viewport"})
-    details["checks"]["has_viewport"] = viewport is not None
-    if viewport:
-        score += 10
-    else:
-        details["findings"].append("no_viewport")
+    # ── Checks that REQUIRE page HTML ─────────────────────────────────
 
-    # Canonical tag (10 pts)
-    canonical = soup.find("link", attrs={"rel": "canonical"})
-    details["checks"]["has_canonical"] = canonical is not None
-    if canonical:
-        score += 10
+    if has_html and soup:
+        # Meta robots ok (10 pts)
+        meta_robots = soup.find("meta", attrs={"name": "robots"})
+        robots_content = meta_robots.get("content", "").lower() if meta_robots else ""
+        noindex = "noindex" in robots_content
+        details["checks"]["meta_robots_ok"] = not noindex
+        if not noindex:
+            score += 10
+        else:
+            details["findings"].append("meta_noindex")
+
+        # Viewport meta (10 pts)
+        viewport = soup.find("meta", attrs={"name": "viewport"})
+        details["checks"]["has_viewport"] = viewport is not None
+        if viewport:
+            score += 10
+        else:
+            details["findings"].append("no_viewport")
+
+        # Canonical tag (10 pts)
+        canonical = soup.find("link", attrs={"rel": "canonical"})
+        details["checks"]["has_canonical"] = canonical is not None
+        if canonical:
+            score += 10
+        else:
+            details["findings"].append("no_canonical")
     else:
-        details["findings"].append("no_canonical")
+        details["checks"]["meta_robots_ok"] = None
+        details["checks"]["has_viewport"] = None
+        details["checks"]["has_canonical"] = None
+        details["checks"]["crawl_blocked"] = True
+        # Scale score: we checked 70pts worth, normalize to 100
+        # so partial results are fairly represented
+        if score > 0:
+            score = score * (100 / 70)
 
     score = safe_score(score)
     details["score"] = score

@@ -32,6 +32,7 @@ class AnalysisRun(models.Model):
     progress = models.IntegerField(default=0)
     composite_score = models.FloatField(null=True, blank=True)
     error_message = models.TextField(blank=True, default="")
+    llm_logs = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

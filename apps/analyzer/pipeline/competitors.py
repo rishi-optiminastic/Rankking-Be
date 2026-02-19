@@ -20,12 +20,11 @@ USER_AGENT = (
 )
 
 
-def _discover_competitors_gemini(brand_name: str, site_context: str) -> list[dict]:
-    """Use Gemini to discover competitors."""
+def _discover_competitors_llm(brand_name: str, site_context: str) -> list[dict]:
+    """Use LLM (via OpenRouter) to discover competitors."""
     try:
-        import google.generativeai as genai
+        from .llm import ask_llm
 
-        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = (
             f"Identify 5-8 competitors for '{brand_name}'. "
             f"Site context: {site_context}\n\n"
@@ -33,8 +32,7 @@ def _discover_competitors_gemini(brand_name: str, site_context: str) -> list[dic
             f"The URL should be the homepage. Example:\n"
             f'[{{"name": "Competitor", "url": "https://competitor.com", "industry": "SaaS"}}]'
         )
-        response = model.generate_content(prompt)
-        text = response.text.strip()
+        text = ask_llm(prompt, preferred_provider="gemini", max_tokens=1024, purpose="Competitor Discovery")
 
         # Extract JSON array
         match = re.search(r"\[.*\]", text, re.DOTALL)
@@ -50,7 +48,7 @@ def _discover_competitors_gemini(brand_name: str, site_context: str) -> list[dic
                 if item.get("name") and item.get("url")
             ]
     except Exception as exc:
-        logger.warning("Gemini competitor discovery failed: %s", exc)
+        logger.warning("Competitor discovery failed: %s", exc)
     return []
 
 
@@ -88,7 +86,7 @@ def discover_competitors(crawl: CrawlResult) -> list[dict]:
         ])
     )
 
-    competitors = _discover_competitors_gemini(brand_name, site_context)
+    competitors = _discover_competitors_llm(brand_name, site_context)
 
     # Validate URLs
     validated = []
