@@ -364,13 +364,56 @@ def _analyze_mention_quality(text: str, aliases: list[str]) -> dict:
     return result
 
 
+def _check_ranking_position(text: str, brand_aliases: list[str]) -> dict:
+    """
+    Check if the brand is ranked #1 (mentioned first) in the AI response.
+    Looks for numbered lists (1. Brand, 2. Other) and position in text.
+    """
+    text_lower = text.lower()
+    result = {"ranked_first": False, "rank_position": 0, "total_listed": 0}
+
+    # Find brand's first appearance position
+    brand_pos = len(text_lower)
+    for alias in brand_aliases:
+        pos = text_lower.find(alias)
+        if pos != -1 and pos < brand_pos:
+            brand_pos = pos
+
+    if brand_pos == len(text_lower):
+        return result  # Brand not found
+
+    # Check numbered list patterns (1. Brand, **1. Brand**, 1) Brand)
+    numbered_pattern = re.compile(
+        r'(?:^|\n)\s*(?:\*{0,2})(\d+)[.)]\s*(?:\*{0,2})\s*(.+?)(?:\n|$|:|\s*[-–—])',
+        re.MULTILINE
+    )
+    matches = numbered_pattern.findall(text_lower)
+
+    if matches:
+        result["total_listed"] = len(matches)
+        for num_str, item_text in matches:
+            for alias in brand_aliases:
+                if alias in item_text:
+                    result["rank_position"] = int(num_str)
+                    if int(num_str) == 1:
+                        result["ranked_first"] = True
+                    return result
+
+    # Fallback: check if brand appears in the top 15% of text (before most competitors)
+    if brand_pos < len(text_lower) * 0.15:
+        result["ranked_first"] = True
+        result["rank_position"] = 1
+
+    return result
+
+
 def _fire_probe(prompt: str, brand_aliases: list[str]) -> tuple[str, bool, float, dict]:
     """Fire a single probe across multiple LLM providers via OpenRouter."""
     try:
         from .llm import ask_multiple_llms
 
         # Ask all 3 providers the same question
-        responses = ask_multiple_llms(prompt, purpose="AI Visibility Probe")
+        responses = ask_multiple_llms(prompt, purpose="AI Visibility Probe", max_tokens=400)
 
         # Combine all responses for matching
         all_text = "\n\n".join(f"[{provider}]: {resp}" for provider, resp in responses.items() if resp)
@@ -386,11 +429,16 @@ def _fire_probe(prompt: str, brand_aliases: list[str]) -> tuple[str, bool, float
 
         # Count how many providers mentioned the brand
         provider_mentions = 0
+        ranked_first_count = 0
         for provider, resp in responses.items():
             if resp:
                 pf_found, _, _ = _match_brand(brand_aliases, resp)
                 if pf_found:
                     provider_mentions += 1
+                    # Check if brand is ranked #1 in this provider's response
+                    ranking = _check_ranking_position(resp, brand_aliases)
+                    if ranking["ranked_first"]:
+                        ranked_first_count += 1
 
         # Boost confidence if multiple providers mention the brand
         if found:
@@ -402,6 +450,7 @@ def _fire_probe(prompt: str, brand_aliases: list[str]) -> tuple[str, bool, float
 
         quality["providers_checked"] = len(responses)
         quality["providers_mentioned"] = provider_mentions
+        quality["ranked_first_count"] = ranked_first_count
 
         return all_text[:2000], found, final_confidence, quality
     except Exception as exc:
@@ -447,33 +496,69 @@ def score_ai_visibility(crawl: CrawlResult) -> tuple[float, dict, list[dict]]:
 
     details["checks"]["probes_generated"] = len(probe_prompts)
 
-    # Score probes
-    max_per_probe = 100.0 / max(len(probe_prompts), 1)
+    # Score ALL probes in parallel (each probe fires 3 providers in parallel internally)
+    # Scoring breakdown (100 pts total):
+    #   20 pts — brand appears in AI search (any provider, any probe)
+    #   50 pts — probe quality (split across probes, based on prominence)
+    #   30 pts — ranking bonus (brand ranked #1)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for prompt in probe_prompts:
+    max_per_probe = 50.0 / max(len(probe_prompts), 1)
+    total_ranked_first = 0
+
+    def _run_probe(prompt):
         response_text, mentioned, confidence, quality = _fire_probe(prompt, brand_aliases)
-
         probe_score = 0.0
         if mentioned:
             base_points = max_per_probe * 0.6
             quality_points = max_per_probe * 0.4 * quality.get("prominence", 0.5)
             probe_score = base_points + quality_points
+        return prompt, response_text, mentioned, confidence, probe_score, quality
 
-        score += probe_score
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(_run_probe, p) for p in probe_prompts]
+        for future in as_completed(futures):
+            try:
+                prompt, response_text, mentioned, confidence, probe_score, quality = future.result()
+                score += probe_score
 
-        probes_data.append({
-            "prompt_used": prompt,
-            "llm_response": response_text[:2000],
-            "brand_mentioned": mentioned,
-            "confidence": round(confidence, 2),
-        })
+                # Track how many probes had brand ranked #1
+                ranked_first = quality.get("ranked_first_count", 0)
+                total_ranked_first += ranked_first
+
+                probes_data.append({
+                    "prompt_used": prompt,
+                    "llm_response": response_text[:2000],
+                    "brand_mentioned": mentioned,
+                    "confidence": round(confidence, 2),
+                })
+            except Exception as exc:
+                logger.warning("Probe execution failed: %s", exc)
 
     mentions = sum(1 for p in probes_data if p["brand_mentioned"])
     details["checks"]["probes_total"] = len(probes_data)
     details["checks"]["probes_mentioned"] = mentions
 
-    if mentions == 0:
+    # 20 pts — flat bonus if brand appears in any AI response
+    if mentions > 0:
+        score += 20.0
+        details["checks"]["ai_presence_bonus"] = 20
+    else:
+        details["checks"]["ai_presence_bonus"] = 0
         details["findings"].append("brand_not_in_ai")
+
+    # 30 pts — ranking bonus if brand is ranked #1
+    total_possible_firsts = len(probe_prompts) * 3  # 3 providers per probe
+    if total_possible_firsts > 0 and total_ranked_first > 0:
+        ranking_ratio = total_ranked_first / total_possible_firsts
+        ranking_bonus = 30.0 * ranking_ratio
+        score += ranking_bonus
+        details["checks"]["ranking_bonus"] = round(ranking_bonus, 1)
+        details["checks"]["ranked_first_total"] = total_ranked_first
+        details["checks"]["ranked_first_possible"] = total_possible_firsts
+    else:
+        details["checks"]["ranking_bonus"] = 0
+        details["checks"]["ranked_first_total"] = 0
 
     score = safe_score(score)
     details["score"] = score

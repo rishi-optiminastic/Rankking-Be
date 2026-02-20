@@ -41,15 +41,25 @@ def extract_domain(url: str) -> str:
 def extract_brand_name(soup: BeautifulSoup, url: str) -> str:
     og_site = soup.find("meta", property="og:site_name")
     if og_site and og_site.get("content"):
-        return og_site["content"].strip()
+        name = og_site["content"].strip()
+        if len(name) <= 40:
+            return name
 
     title_tag = soup.find("title")
     if title_tag and title_tag.string:
-        parts = re.split(r"[|\-–—]", title_tag.string)
-        if len(parts) > 1:
-            return parts[-1].strip()
-        return parts[0].strip()
+        parts = re.split(r"[|\-–—:]", title_tag.string)
+        # Try each part — prefer short ones that look like brand names
+        candidates = [p.strip() for p in parts if p.strip()]
+        # If multiple parts, pick the shortest (likely the brand, not tagline)
+        if len(candidates) > 1:
+            short = min(candidates, key=len)
+            if len(short) <= 30:
+                return short
+        # Single part — only use if it's short enough to be a brand name
+        if candidates and len(candidates[0]) <= 30:
+            return candidates[0]
 
+    # Fallback: domain name (most reliable for well-known sites)
     return extract_domain(url).split(".")[0].capitalize()
 
 

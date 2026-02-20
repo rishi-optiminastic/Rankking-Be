@@ -1,5 +1,6 @@
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .models import (
     AIVisibilityProbe,
@@ -8,9 +9,9 @@ from .models import (
     PageScore,
     Recommendation,
 )
-from .pipeline.aggregator import compute_composite, detect_industry
+from .pipeline.aggregator import compute_composite, compute_static_composite, detect_industry
 from .pipeline.ai_visibility import score_ai_visibility
-from .pipeline.competitors import discover_competitors, score_competitor
+from .pipeline.competitors import discover_competitors
 from .pipeline.content import score_content
 from .pipeline.crawler import crawl_page
 from .pipeline.eeat import score_eeat
@@ -29,11 +30,43 @@ def _update_status(run: AnalysisRun, status: str, progress: int = 0):
     run.save(update_fields=["status", "progress", "updated_at"])
 
 
+def _score_competitor_static(url: str) -> tuple[dict | None, float]:
+    """Score a competitor using STATIC-ONLY pillars (no LLM calls)."""
+    crawl = crawl_page(url)
+    if not crawl.ok:
+        return None, 0.0
+
+    content_score, content_details = score_content(crawl)
+    schema_score_val, schema_details = score_schema(crawl)
+    # Use static-only E-E-A-T (skip_gemini=True)
+    eeat_score_val, eeat_details = score_eeat(crawl, skip_gemini=True)
+    technical_score_val, technical_details = score_technical(crawl)
+
+    composite = compute_static_composite(
+        content_score, schema_score_val, eeat_score_val, technical_score_val
+    )
+
+    page_data = {
+        "url": url,
+        "content_score": content_score,
+        "content_details": content_details,
+        "schema_score": schema_score_val,
+        "schema_details": schema_details,
+        "eeat_score": eeat_score_val,
+        "eeat_details": eeat_details,
+        "technical_score": technical_score_val,
+        "technical_details": technical_details,
+        "composite_score": composite,
+    }
+
+    return page_data, composite
+
+
 def _run_partial_analysis(run: AnalysisRun, crawl):
     """
     Run partial analysis when crawler fails to get HTML.
     Still checks: robots.txt, sitemap, llms.txt, HTTPS, load time.
-    Also runs entity + AI visibility via Gemini (don't need HTML).
+    Also runs entity + AI visibility via LLM (don't need HTML).
     """
     logger.info("Run %d: crawl failed (%s), running partial analysis", run.id, crawl.error)
     start_log_collection()
@@ -61,32 +94,42 @@ def _run_partial_analysis(run: AnalysisRun, crawl):
 
     # Technical — works without HTML (robots.txt, sitemap, llms.txt, HTTPS)
     technical_score_val, technical_details = score_technical(crawl)
+
+    # Run entity + AI visibility in parallel
+    entity_score_val, entity_details = 0.0, {}
+    ai_vis_score, ai_vis_details, probes_data = 0.0, {}, []
+
+    def _run_entity():
+        return score_entity(crawl)
+
+    def _run_ai_vis():
+        return score_ai_visibility(crawl)
+
     _update_status(run, AnalysisRun.Status.ANALYZING, 55)
 
-    # Entity — uses Gemini, can work with just URL + brand name
-    entity_score_val, entity_details = 0.0, {}
-    try:
-        entity_score_val, entity_details = score_entity(crawl)
-        _update_status(run, AnalysisRun.Status.ANALYZING, 70)
-    except Exception as exc:
-        logger.warning("Entity scoring failed for run %d: %s", run.id, exc)
-        entity_details = {"error": str(exc)}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        entity_future = executor.submit(_run_entity)
+        ai_vis_future = executor.submit(_run_ai_vis)
 
-    # AI visibility — uses Gemini, can work with just URL
-    ai_vis_score, ai_vis_details, probes_data = 0.0, {}, []
-    try:
-        ai_vis_score, ai_vis_details, probes_data = score_ai_visibility(crawl)
-        _update_status(run, AnalysisRun.Status.ANALYZING, 80)
-    except Exception as exc:
-        logger.warning("AI visibility failed for run %d: %s", run.id, exc)
-        ai_vis_details = {"error": str(exc)}
+        try:
+            entity_score_val, entity_details = entity_future.result()
+        except Exception as exc:
+            logger.warning("Entity scoring failed for run %d: %s", run.id, exc)
+            entity_details = {"error": str(exc)}
+
+        try:
+            ai_vis_score, ai_vis_details, probes_data = ai_vis_future.result()
+        except Exception as exc:
+            logger.warning("AI visibility failed for run %d: %s", run.id, exc)
+            ai_vis_details = {"error": str(exc)}
+
+    _update_status(run, AnalysisRun.Status.ANALYZING, 80)
 
     for probe in probes_data:
         AIVisibilityProbe.objects.create(analysis_run=run, **probe)
 
     _update_status(run, AnalysisRun.Status.SCORING, 85)
 
-    # Composite — some pillars will be 0 but that's accurate
     composite = compute_composite(
         content_score, schema_score_val, eeat_score_val,
         technical_score_val, entity_score_val, ai_vis_score,
@@ -110,7 +153,7 @@ def _run_partial_analysis(run: AnalysisRun, crawl):
         composite_score=composite,
     )
 
-    # Recommendations — technical findings + crawl-failed finding
+    # Recommendations
     pillar_details = {
         "content": content_details,
         "schema": schema_details,
@@ -119,7 +162,6 @@ def _run_partial_analysis(run: AnalysisRun, crawl):
         "entity": entity_details,
         "ai_visibility": ai_vis_details,
     }
-    # Add a special finding about the crawl failure
     technical_details.setdefault("findings", [])
     if crawl.status_code == 403:
         technical_details["findings"].append("crawl_blocked_403")
@@ -156,7 +198,6 @@ def run_single_page_analysis(run_id: int):
         crawl = crawl_page(run.url)
 
         if not crawl.ok:
-            # Don't fail — run partial analysis instead
             _run_partial_analysis(run, crawl)
             return
 
@@ -166,36 +207,55 @@ def run_single_page_analysis(run_id: int):
         industry = detect_industry(crawl.soup, crawl.text)
         logger.info("Run %d: detected industry = %s", run_id, industry)
 
-        # Phase 2: Static pillars
+        # Phase 2: Run static pillars (fast, no LLM)
         content_score, content_details = score_content(crawl)
-        _update_status(run, AnalysisRun.Status.ANALYZING, 25)
-
         schema_score_val, schema_details = score_schema(crawl)
-        _update_status(run, AnalysisRun.Status.ANALYZING, 35)
-
-        eeat_score_val, eeat_details = score_eeat(crawl)
-        _update_status(run, AnalysisRun.Status.ANALYZING, 45)
-
         technical_score_val, technical_details = score_technical(crawl)
-        _update_status(run, AnalysisRun.Status.ANALYZING, 55)
+        _update_status(run, AnalysisRun.Status.ANALYZING, 30)
 
-        # Phase 3: Gemini pillars
+        # Phase 3: Run LLM-dependent pillars IN PARALLEL
+        # E-E-A-T, Entity, and AI Visibility are all independent
+        eeat_score_val, eeat_details = 0.0, {}
         entity_score_val, entity_details = 0.0, {}
         ai_vis_score, ai_vis_details, probes_data = 0.0, {}, []
 
-        try:
-            entity_score_val, entity_details = score_entity(crawl)
-            _update_status(run, AnalysisRun.Status.ANALYZING, 65)
-        except Exception as exc:
-            logger.warning("Entity scoring failed for run %d: %s", run_id, exc)
-            entity_details = {"error": str(exc)}
+        def _run_eeat():
+            return score_eeat(crawl)
 
-        try:
-            ai_vis_score, ai_vis_details, probes_data = score_ai_visibility(crawl)
-            _update_status(run, AnalysisRun.Status.ANALYZING, 75)
-        except Exception as exc:
-            logger.warning("AI visibility failed for run %d: %s", run_id, exc)
-            ai_vis_details = {"error": str(exc)}
+        def _run_entity():
+            return score_entity(crawl, industry=industry)
+
+        def _run_ai_vis():
+            return score_ai_visibility(crawl)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            eeat_future = executor.submit(_run_eeat)
+            entity_future = executor.submit(_run_entity)
+            ai_vis_future = executor.submit(_run_ai_vis)
+
+            try:
+                eeat_score_val, eeat_details = eeat_future.result()
+            except Exception as exc:
+                logger.warning("E-E-A-T scoring failed for run %d: %s", run_id, exc)
+                eeat_details = {"error": str(exc)}
+
+            _update_status(run, AnalysisRun.Status.ANALYZING, 50)
+
+            try:
+                entity_score_val, entity_details = entity_future.result()
+            except Exception as exc:
+                logger.warning("Entity scoring failed for run %d: %s", run_id, exc)
+                entity_details = {"error": str(exc)}
+
+            _update_status(run, AnalysisRun.Status.ANALYZING, 65)
+
+            try:
+                ai_vis_score, ai_vis_details, probes_data = ai_vis_future.result()
+            except Exception as exc:
+                logger.warning("AI visibility failed for run %d: %s", run_id, exc)
+                ai_vis_details = {"error": str(exc)}
+
+        _update_status(run, AnalysisRun.Status.ANALYZING, 75)
 
         # Save AI probes
         for probe in probes_data:
@@ -241,29 +301,37 @@ def run_single_page_analysis(run_id: int):
         for rec in recs:
             Recommendation.objects.create(analysis_run=run, **rec)
 
-        # Phase 6: Competitor discovery & scoring
+        # Phase 6: Competitor discovery & scoring (static-only, no LLM for competitors)
         _update_status(run, AnalysisRun.Status.SCORING, 85)
         try:
             competitor_list = discover_competitors(crawl)
-            for comp_data in competitor_list:
-                comp = Competitor.objects.create(
-                    analysis_run=run,
-                    name=comp_data["name"],
-                    url=comp_data["url"],
-                    industry=comp_data.get("industry", ""),
-                )
-                try:
-                    page_data, comp_composite = score_competitor(comp_data["url"])
-                    if page_data:
-                        comp_page = PageScore.objects.create(
-                            analysis_run=run, **page_data
+
+            # Score competitors in parallel (static-only, no LLM)
+            def _score_comp(comp_data):
+                page_data, comp_composite = _score_competitor_static(comp_data["url"])
+                return comp_data, page_data, comp_composite
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(_score_comp, cd) for cd in competitor_list]
+                for future in as_completed(futures):
+                    try:
+                        comp_data, page_data, comp_composite = future.result()
+                        comp = Competitor.objects.create(
+                            analysis_run=run,
+                            name=comp_data["name"],
+                            url=comp_data["url"],
+                            industry=comp_data.get("industry", ""),
                         )
-                        comp.page_score = comp_page
-                        comp.composite_score = comp_composite
-                        comp.scored = True
-                        comp.save()
-                except Exception as exc:
-                    logger.warning("Competitor scoring failed for %s: %s", comp_data["url"], exc)
+                        if page_data:
+                            comp_page = PageScore.objects.create(
+                                analysis_run=run, **page_data
+                            )
+                            comp.page_score = comp_page
+                            comp.composite_score = comp_composite
+                            comp.scored = True
+                            comp.save()
+                    except Exception as exc:
+                        logger.warning("Competitor scoring failed: %s", exc)
         except Exception as exc:
             logger.warning("Competitor discovery failed for run %d: %s", run_id, exc)
 

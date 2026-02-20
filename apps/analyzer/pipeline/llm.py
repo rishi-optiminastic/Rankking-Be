@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -37,40 +38,51 @@ _call_counter = 0
 # Cache availability check so we don't re-check every call
 _availability_cache = None
 
-# ── Thread-local log collector ────────────────────────────────────────────
-# Each analysis thread gets its own log list
+# ── Thread-safe log collector ─────────────────────────────────────────────
+# Uses a global list protected by a lock so worker threads (ThreadPoolExecutor)
+# can also append logs during parallel LLM calls.
 
-_thread_local = threading.local()
+_log_lock = threading.Lock()
+_collected_logs: list[dict] | None = None
 
 
 def start_log_collection():
-    """Start collecting LLM logs for the current thread."""
-    _thread_local.logs = []
+    """Start collecting LLM logs (thread-safe, works across ThreadPoolExecutor)."""
+    global _collected_logs
+    with _log_lock:
+        _collected_logs = []
 
 
 def get_collected_logs() -> list[dict]:
-    """Get all collected LLM logs for the current thread and clear."""
-    logs = getattr(_thread_local, "logs", [])
-    _thread_local.logs = []
-    return logs
+    """Get all collected LLM logs and clear."""
+    global _collected_logs
+    with _log_lock:
+        logs = _collected_logs or []
+        _collected_logs = None
+        return logs
+
+
+def _sanitize(text: str) -> str:
+    """Remove null bytes and other chars PostgreSQL JSON can't store."""
+    return text.replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _log_call(model: str, purpose: str, prompt: str, response: str, status: str, duration_ms: int):
-    """Record an LLM call to the thread-local log."""
-    logs = getattr(_thread_local, "logs", None)
-    if logs is None:
-        return  # Not collecting
+    """Record an LLM call to the shared log (thread-safe)."""
+    with _log_lock:
+        if _collected_logs is None:
+            return  # Not collecting
 
-    label = MODEL_LABELS.get(model, model)
-    logs.append({
-        "model": label,
-        "model_id": model,
-        "purpose": purpose,
-        "prompt": prompt[:500],
-        "response": response[:2000],
-        "status": status,
-        "duration_ms": duration_ms,
-    })
+        label = MODEL_LABELS.get(model, model)
+        _collected_logs.append({
+            "model": label,
+            "model_id": model,
+            "purpose": purpose,
+            "prompt": _sanitize(prompt[:1000]),
+            "response": _sanitize(response[:3000]),
+            "status": status,
+            "duration_ms": duration_ms,
+        })
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -159,7 +171,7 @@ def _call_openrouter(
         "temperature": temperature,
     }
 
-    prompt_preview = prompt[:120].replace('\n', ' ')
+    prompt_preview = _sanitize(prompt[:120]).replace('\n', ' ')
     logger.info("[LLM REQUEST] >> %s | %s | prompt: \"%s...\"", model, purpose, prompt_preview)
 
     t0 = time.time()
@@ -262,10 +274,10 @@ def _call_gemini_direct(prompt: str, purpose: str = "") -> str:
         return ""
 
 
-def ask_multiple_llms(prompt: str, providers: list[str] | None = None, purpose: str = "") -> dict[str, str]:
+def ask_multiple_llms(prompt: str, providers: list[str] | None = None, purpose: str = "", max_tokens: int = 512) -> dict[str, str]:
     """
-    Ask the same prompt to multiple LLMs and return all responses.
-    Useful for AI visibility probes -- test across providers.
+    Ask the same prompt to multiple LLMs IN PARALLEL and return all responses.
+    Useful for AI visibility probes -- test across providers concurrently.
 
     Returns: {"gpt": "response...", "claude": "response...", "gemini": "response..."}
     """
@@ -280,9 +292,21 @@ def ask_multiple_llms(prompt: str, providers: list[str] | None = None, purpose: 
         result = _call_gemini_direct(prompt, purpose)
         return {"gemini": result} if result else {}
 
+    # Fire all providers in parallel
     results = {}
-    for provider in providers:
-        response = ask_llm(prompt, preferred_provider=provider, purpose=purpose)
-        results[provider] = response
+
+    def _call_provider(provider):
+        return provider, ask_llm(prompt, preferred_provider=provider, purpose=purpose, max_tokens=max_tokens)
+
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        futures = {executor.submit(_call_provider, p): p for p in providers}
+        for future in as_completed(futures):
+            try:
+                provider, response = future.result()
+                results[provider] = response
+            except Exception as exc:
+                provider = futures[future]
+                logger.warning("Parallel LLM call failed for %s: %s", provider, exc)
+                results[provider] = ""
 
     return results

@@ -341,11 +341,12 @@ def _static_content_eeat(soup, html_lower: str) -> tuple[float, dict]:
 
 # ── Main scorer ───────────────────────────────────────────────────────────
 
-def score_eeat(crawl: CrawlResult) -> tuple[float, dict]:
+def score_eeat(crawl: CrawlResult, skip_gemini: bool = False) -> tuple[float, dict]:
     """
     E-E-A-T scoring with hybrid approach:
     - Structural signals (40 pts): links, dates, trust pages — always reliable
     - Content E-E-A-T (60 pts): Gemini deep analysis if available, static fallback otherwise
+    - skip_gemini: if True, use static-only scoring (for competitor analysis)
     """
     if not crawl.ok:
         return 0.0, {"error": crawl.error}
@@ -371,7 +372,10 @@ def score_eeat(crawl: CrawlResult) -> tuple[float, dict]:
         details["findings"].append("no_about_page")
 
     # Part 2: Content E-E-A-T (max 60 pts)
-    gemini_result, gemini_ok = _gemini_eeat_analysis(crawl.text, crawl.url)
+    if skip_gemini:
+        gemini_result, gemini_ok = {}, False
+    else:
+        gemini_result, gemini_ok = _gemini_eeat_analysis(crawl.text, crawl.url)
 
     if gemini_ok:
         details["checks"]["scoring_mode"] = "gemini"
