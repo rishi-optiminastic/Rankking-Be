@@ -15,12 +15,39 @@ direct crawler (+ scraper API) on failure.
 import asyncio
 import logging
 import os
+import re
 
 logger = logging.getLogger("apps")
 
 DEFAULT_LIMIT = 13
 # Hard wall-clock guard so a slow/looping crawl can't hang the analysis thread.
 DEFAULT_TIMEOUT = 90
+
+# Same-site hrefs that are not pages, so following them only burns the page cap
+# and reports a crawl failure for a site that is perfectly healthy.
+#
+# /cdn-cgi/ is Cloudflare's own namespace. Its email-protection links are the
+# common case: Cloudflare rewrites every mailto: into
+# /cdn-cgi/l/email-protection#<hex>, which is decoded by JavaScript in the
+# browser and 404s / times out for an HTTP crawler. Crawlee retries, exhausts
+# them, and logs an error — that is SIGNALOR-Z, raised against a prospect's site
+# during an outreach benchmark rather than against anything of ours.
+#
+# The rest are binary or non-navigational targets that would spend the cap
+# without yielding text to score.
+# Anchored deliberately: Crawlee tests these with ``pattern.match(url)``, which
+# matches from the START of the full URL, so a bare "/cdn-cgi/" would never fire.
+SKIP_URL_PATTERNS = [
+    re.compile(r".*/cdn-cgi/.*", re.I),
+    # The query/fragment tail is optional and matched explicitly: patterns are
+    # tested against the raw extracted href, before any fragment normalisation,
+    # so "/whitepaper.pdf#page=2" must still be recognised as a download.
+    re.compile(
+        r".*\.(?:pdf|zip|gz|tar|docx?|xlsx?|pptx?|csv|mp[34]|avi|mov|wav|dmg|exe|svg|ico)"
+        r"(?:[?#].*)?$",
+        re.I,
+    ),
+]
 
 
 class CrawleeError(Exception):
@@ -83,9 +110,10 @@ async def _crawl_async(url: str, limit: int, timeout: int) -> list[dict]:
                 "status": getattr(context.http_response, "status_code", 0) or 0,
             }
         )
-        # Follow same-site links up to the request cap.
+        # Follow same-site links up to the request cap, minus the ones that are
+        # not pages (see SKIP_URL_PATTERNS).
         try:
-            await context.enqueue_links()
+            await context.enqueue_links(exclude=SKIP_URL_PATTERNS)
         except Exception as exc:  # noqa: BLE001 - link discovery is best-effort
             logger.debug("crawlee enqueue_links failed for %s: %s", context.request.url, exc)
 

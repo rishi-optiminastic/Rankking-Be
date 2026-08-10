@@ -1,5 +1,6 @@
 from django.urls import path
 
+from .sentry_views import SentryWebhookView
 from .shopify_compliance import (
     ShopifyCustomerDataRequestWebhookView,
     ShopifyCustomerRedactWebhookView,
@@ -192,6 +193,7 @@ urlpatterns = [
         ShopifyShopRedactWebhookView.as_view(),
         name="shopify-shop-redact",
     ),
+    path("sentry/webhook/", SentryWebhookView.as_view(), name="sentry-webhook"),
     path(
         "shopify/connect/",
         ShopifyConnectView.as_view(),

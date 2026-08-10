@@ -33,6 +33,16 @@ if SENTRY_DSN:
         environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
     )
 
+# ── Sentry -> GitHub issue bridge ──────────────────────────────────────────
+# Sentry's native "create a GitHub issue" alert action needs a Team plan; this
+# org is on Developer, so apps/integrations/sentry_bridge.py does it instead.
+# SENTRY_WEBHOOK_SECRET is the internal integration's Client Secret and is what
+# authenticates the webhook — unset disables the endpoint rather than trusting
+# anyone who finds the URL. SENTRY_GITHUB_REPO is the "owner/name" issues are
+# filed against; it must match an active GithubInstallation.repo_full_name.
+SENTRY_WEBHOOK_SECRET = os.getenv("SENTRY_WEBHOOK_SECRET", "").strip()
+SENTRY_GITHUB_REPO = os.getenv("SENTRY_GITHUB_REPO", "").strip()
+
 LOGS_DIR = BASE_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
@@ -474,3 +484,35 @@ CELERY_TIMEZONE = "UTC"
 # leaving it unset disables generation entirely (the safe default). Reads are
 # open so a finished report can be shared by link.
 OUTREACH_BENCHMARK_KEY = os.getenv("OUTREACH_BENCHMARK_KEY", "").strip()
+
+
+# Hours a finished outreach benchmark is served back instead of regenerating an
+# identical one (see views/outreach._reusable_benchmark). Each generation costs
+# ~18 search-enabled answer-engine calls. 0 disables reuse; a caller can always
+# bypass it per-request with force=true.
+def _env_number(name: str, default, cast):
+    """Parse an optional numeric env var without letting a typo take down boot.
+
+    These are cost knobs, not correctness settings. A bare ``float(os.getenv(...))``
+    raises at import time, so ``OUTREACH_REUSE_HOURS=1d`` would stop the web
+    process and both workers from starting over a cosmetic mistake in an optional
+    value. Falling back to the default and logging is the proportionate response.
+    """
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        import warnings
+
+        warnings.warn(f"{name}={raw!r} is not a number; using {default}", stacklevel=2)
+        return default
+
+
+OUTREACH_REUSE_HOURS = _env_number("OUTREACH_REUSE_HOURS", 24.0, float)
+# Seconds an answer-engine reply to one buyer question is reused across
+# benchmarks. The engines never see the brand (it is matched against the reply),
+# so the same question yields the same answer for every prospect and paying
+# twice buys identical words. 0 disables.
+OUTREACH_ANSWER_CACHE_SECONDS = _env_number("OUTREACH_ANSWER_CACHE_SECONDS", 86400, int)

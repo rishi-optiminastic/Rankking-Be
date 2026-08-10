@@ -41,6 +41,22 @@ OUTREACH_MAX_PAGES = 1
 _MAX_OPPORTUNITIES = 5
 
 
+def _answer_cache_ttl() -> int:
+    """Seconds an engine's answer to a buyer question is reused across benchmarks.
+
+    Every measured prompt costs three search-enabled engine calls, and the engines
+    are asked the question alone — the brand is matched against the reply, never
+    sent — so two prospects whose benchmarks generate the same buyer question were
+    buying the identical answer twice. Reusing it changes no number in the report.
+
+    Bounded rather than indefinite because the report's claim is what engines say
+    *now*: a day old is still today's answer, a month old is not. 0 disables it.
+    """
+    from django.conf import settings
+
+    return int(getattr(settings, "OUTREACH_ANSWER_CACHE_SECONDS", 86400) or 0)
+
+
 def _brand_and_industry(crawl, run: AnalysisRun) -> tuple[str, str]:
     """Brand label and industry for prompt generation, from the homepage crawl."""
     from ..pipeline.aggregator import detect_industry
@@ -119,6 +135,7 @@ def _measure(run: AnalysisRun, prompts: list[str], brand: str) -> None:
                 run.url,
                 runs=1,
                 allowed_engines=OUTREACH_ENGINES,
+                cache_ttl=_answer_cache_ttl(),
             )
             track = PromptTrack.objects.create(
                 analysis_run=run,
@@ -201,8 +218,33 @@ def _opportunities(brand: str, industry: str, findings: dict) -> list[str]:
     return [line for line in lines if len(line) > 20][:_MAX_OPPORTUNITIES]
 
 
+def _drain_spend(run) -> None:
+    """Move this run's LLM logs out of the collector and onto the row.
+
+    Must run on EVERY exit, not just success. Two reasons, both bugs we had:
+    a benchmark that crawls, measures, then dies still spent real money, and
+    recording nothing leaves the budget fuse blind to it; and the collector is a
+    process global, so logs left undrained in a Celery child get billed to
+    whichever outreach run that child picks up next.
+
+    Fail-soft: accounting must never be the reason a finished report is lost.
+    """
+    from core.llm.client import get_collected_logs
+
+    from ..tasks import accounting
+
+    try:
+        run.llm_logs = get_collected_logs()
+        run.save(update_fields=["llm_logs"])
+        accounting._record_spend(run)
+    except Exception:
+        logger.exception("outreach: could not record spend for run %s", getattr(run, "id", "?"))
+
+
 def run_outreach_benchmark(run_id: int) -> None:
     """Build the outreach benchmark for ``run_id``. Never raises."""
+    from core.llm.client import start_log_collection
+
     from ..pipeline.crawler import crawl_site
     from ..tasks import progress
 
@@ -212,6 +254,11 @@ def run_outreach_benchmark(run_id: int) -> None:
         logger.error("outreach: run %s not found", run_id)
         return
 
+    # Arm the collector before the first LLM call. ``_log_call`` drops every
+    # entry while ``_collected_logs`` is None, so without this the drain below
+    # collects an empty list and every benchmark records $0 — which is exactly
+    # how this path stayed invisible to the budget fuse in the first place.
+    start_log_collection()
     try:
         progress._update_status(run, AnalysisRun.Status.CRAWLING, 5, "Reading the homepage")
         crawl, _site_map, _extra = crawl_site(run.url, max_pages=OUTREACH_MAX_PAGES)
@@ -259,3 +306,8 @@ def run_outreach_benchmark(run_id: int) -> None:
         run.status = AnalysisRun.Status.FAILED
         run.error_message = str(exc)[:500]
         run.save(update_fields=["status", "error_message", "updated_at"])
+    finally:
+        # Every exit: the crawl-failed and no-prompts returns above, the success
+        # path, and the exception path. A run that spent money and then failed
+        # must still report what it spent.
+        _drain_spend(run)

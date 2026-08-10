@@ -15,6 +15,8 @@ extracts signals, and computes 5-factor weighted AI visibility scores.
 import logging
 import os
 
+from django.core.cache import cache
+
 logger = logging.getLogger("apps")
 
 # Maps internal provider keys → PromptResult.Engine choices
@@ -630,12 +632,41 @@ def generate_brand_prompts(
     ]
 
 
+def _answer_bundle_key(prompt_text: str, provider_keys: list[str]) -> str:
+    """Cache identity for "these engines answering this question".
+
+    Both halves of an engine's identity are folded in: the model id
+    (ANSWER_ENGINE_*_MODEL) and the search mode (ANSWER_ENGINE_*_SEARCH). The
+    search mode matters as much as the model — flipping Claude from native to
+    Exa is a different retrieval path yielding different text and a different
+    citation count, so keying on the model alone would keep serving native-search
+    answers for a full TTL after the switch. The prompt is whitespace- and
+    case-normalised then hashed, since prompts are free text of unbounded length.
+    """
+    import hashlib
+
+    from core.llm.client import ANSWER_ENGINES
+
+    engines = ",".join(
+        "{}={}/{}".format(
+            k,
+            (ANSWER_ENGINES.get(k) or {}).get("model", ""),
+            (ANSWER_ENGINES.get(k) or {}).get("search", ""),
+        )
+        for k in sorted(provider_keys)
+    )
+    normalized = " ".join((prompt_text or "").split()).lower()
+    digest = hashlib.sha256(f"{engines}\x00{normalized}".encode()).hexdigest()[:32]
+    return f"answer_engines:{digest}"
+
+
 def fire_prompt_across_engines(
     prompt_text: str,
     brand_name: str,
     brand_url: str,
     runs: int = DEFAULT_RUNS,
     allowed_engines: list[str] | None = None,
+    cache_ttl: int = 0,
 ) -> list[dict]:
     """
     Fire prompt_text to every AI answer engine plus Google and Bing, and gather
@@ -646,6 +677,15 @@ def fire_prompt_across_engines(
     memorised before its training cutoff.
 
     allowed_engines: PLAN_LIMITS["engines"] list; None = all configured.
+
+    ``cache_ttl`` (seconds, 0 = off) reuses a stored set of engine answers for an
+    identical question. Sound because the engines are asked the buyer question
+    alone — the brand is matched against the reply afterwards, never sent — so the
+    answer is the same text whoever asked, and firing again buys identical words
+    at full price. Off by default: daily prompt tracking wants a genuinely fresh
+    measurement each day. Only the outreach benchmark opts in, where the same
+    buyer question recurs across prospects.
+
     Returns list of dicts: engine, response_text, brand_mentioned, sentiment, confidence, rank_position
     """
     from core.llm.client import ask_answer_engines
@@ -665,16 +705,37 @@ def fire_prompt_across_engines(
     for run_idx in range(runs):
         responses: dict[str, dict] = {}
         if provider_keys:
-            try:
-                responses = ask_answer_engines(
-                    prompt_text,
-                    engines=provider_keys,
-                    purpose=f"Prompt Track (run {run_idx + 1}/{runs})",
-                    max_tokens=1024,
-                )
-            except Exception as exc:
-                logger.warning("fire_prompt run %d failed: %s", run_idx + 1, exc)
-                continue
+            # Only cache a single-run measurement. With runs > 1 the point is to
+            # sample the engine several times; serving the same stored bundle to
+            # every iteration would collapse N samples into one answer repeated
+            # N times, and those duplicates then inflate coverage downstream.
+            key = _answer_bundle_key(prompt_text, provider_keys) if (cache_ttl > 0 and runs == 1) else ""
+            if key:
+                try:
+                    responses = cache.get(key) or {}
+                except Exception:
+                    logger.warning("answer-engine cache read failed", exc_info=True)
+                    responses = {}
+            if not responses:
+                try:
+                    responses = ask_answer_engines(
+                        prompt_text,
+                        engines=provider_keys,
+                        purpose=f"Prompt Track (run {run_idx + 1}/{runs})",
+                        max_tokens=1024,
+                    )
+                except Exception as exc:
+                    logger.warning("fire_prompt run %d failed: %s", run_idx + 1, exc)
+                    continue
+                # Store only a complete set of real answers. A partial or empty
+                # bundle cached here would let one transient engine failure read
+                # as "not cited" on every later benchmark until the TTL expired —
+                # a fabricated finding in a document sent to a named prospect.
+                if key and all((responses.get(k) or {}).get("text") for k in provider_keys):
+                    try:
+                        cache.set(key, responses, cache_ttl)
+                    except Exception:
+                        logger.warning("answer-engine cache write failed", exc_info=True)
 
         for provider_key, payload in responses.items():
             engine = _ENGINE_MAP.get(provider_key, provider_key)

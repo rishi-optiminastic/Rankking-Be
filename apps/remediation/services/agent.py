@@ -216,6 +216,25 @@ def dispatch_tool(name: str, args: dict, client, profile: dict, state: dict) -> 
 # --------------------------------------------------------------------------- #
 # validation (pure-ish: only get_file for sha lookup)
 # --------------------------------------------------------------------------- #
+# What the user sees when the agent's own patch fails validation. The messages
+# validate_edits returns are written FOR THE MODEL ("each must be an object with
+# 'path' and 'new_content'") and are meaningless to the person reading the task.
+# They surfaced verbatim in the auto-fix panel because the failure rides in the
+# same ``cannot_fix`` slot as a real, human-readable refusal from the agent.
+PATCH_INVALID_MESSAGE = "The agent couldn't produce a valid patch for this one. It needs a person."
+
+
+def _patch_failed(err: str, finding_code: str, reasoning: list[str]) -> dict:
+    """A guard rejection of the model's own edits, kept out of the user's face.
+
+    Distinct from the agent calling ``cannot_fix`` itself: that reason is written
+    for a human and is shown as-is. This one is a schema/safety failure, so the
+    detail goes to the log and the user gets a sentence they can act on.
+    """
+    logger.warning("github.agent %s: rejected the model's edits: %s", finding_code, err)
+    return {"result": None, "reasoning": "\n".join(reasoning), "cannot_fix": PATCH_INVALID_MESSAGE}
+
+
 def validate_edits(raw_edits, client, branch: str) -> tuple[list[FileEdit], str | None]:
     """Turn proposed edits into FileEdits, or return (partial, error) on any guard failure."""
     # Shape-guard first: the model sometimes returns `edits` as a bare string (a
@@ -411,7 +430,7 @@ def _run_loop(messages: list[dict], client, profile: dict, finding_code: str) ->
                     terminal = "retry"
                     continue
                 if err:
-                    return {"result": None, "reasoning": "\n".join(reasoning_bits), "cannot_fix": err}
+                    return _patch_failed(err, finding_code, reasoning_bits)
                 result = FixResult(edits=edits, applied=[finding_code], skipped=[])
                 summary = args.get("summary") or ""
                 if summary:
@@ -469,7 +488,8 @@ def _run_loop(messages: list[dict], client, profile: dict, finding_code: str) ->
                     "reasoning": "\n".join(reasoning_bits),
                     "cannot_fix": None,
                 }
-            return {"result": None, "reasoning": "\n".join(reasoning_bits), "cannot_fix": err}
+            # ``edits`` empty with no error means the model proposed nothing at all.
+            return _patch_failed(err or "propose_changes returned no edits", finding_code, reasoning_bits)
 
     return {
         "result": None,

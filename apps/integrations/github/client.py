@@ -129,6 +129,42 @@ class GithubClient:
             raise ValueError(f"create_pull_request failed (HTTP {resp.status_code}): {resp.text[:300]}")
         return resp.json()
 
+    def create_issue(self, title: str, body: str, labels: list[str] | None = None) -> dict:
+        """Open an issue. Used by the Sentry bridge to file an error as work."""
+        payload: dict = {"title": title[:250], "body": body}
+        if labels:
+            payload["labels"] = labels
+        resp = self.session.post(self._repo_url("/issues"), json=payload, timeout=20)
+        if resp.status_code not in (200, 201):
+            raise ValueError(f"create_issue failed (HTTP {resp.status_code}): {resp.text[:300]}")
+        return resp.json()
+
+    def search_issues(self, query: str) -> list[dict]:
+        """Issues in THIS repo matching a search qualifier string.
+
+        Used for idempotency: the Sentry bridge looks for an existing issue
+        carrying the same Sentry short-id before opening another one. Search is
+        best-effort — a failure returns nothing rather than raising, because the
+        caller must not lose an alert over a flaky search endpoint.
+        """
+        try:
+            resp = self.session.get(
+                f"{GITHUB_API}/search/issues",
+                params={"q": f"repo:{self.repo} {query}"},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.warning("search_issues HTTP %s: %s", resp.status_code, resp.text[:200])
+                return []
+            return resp.json().get("items", []) or []
+        except Exception:
+            # Deliberately broader than RequestException: a 200 carrying an HTML
+            # error page (Cloudflare, GitHub maintenance) makes .json() raise
+            # ValueError, and letting that escape would drop the alert this
+            # search only exists to de-duplicate. Matches search_code above.
+            logger.warning("search_issues failed for %s", self.repo, exc_info=True)
+            return []
+
     def ensure_label(self, name: str, color: str, description: str = "") -> None:
         """Create a repo label if it isn't there yet.
 

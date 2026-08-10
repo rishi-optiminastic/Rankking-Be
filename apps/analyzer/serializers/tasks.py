@@ -244,6 +244,10 @@ class UserActionSerializer(serializers.ModelSerializer):
         source="recommendation.finding_code", read_only=True, default=""
     )
     priority = serializers.CharField(source="recommendation.priority", read_only=True, default="")
+    # Provenance ("analyzer" | "ai_insight" | "geo_signal") so the tasks table
+    # can show WHERE each task came from — a task tagged with its source system
+    # reads as a measurement, not an unsourced instruction.
+    task_source = serializers.CharField(source="recommendation.source", read_only=True, default="")
     attribution = serializers.SerializerMethodField()
     prompt_track_id = serializers.SerializerMethodField()
 
@@ -299,6 +303,7 @@ class UserActionSerializer(serializers.ModelSerializer):
             "pillar",
             "finding_code",
             "priority",
+            "task_source",
             "attribution",
             "prompt_track_id",
         ]

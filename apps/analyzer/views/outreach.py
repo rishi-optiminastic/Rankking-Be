@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import hmac
 import logging
+from datetime import timedelta
+from urllib.parse import urlparse
 
 from django.conf import settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -67,6 +70,66 @@ def _key_ok(request) -> bool:
     return bool(supplied) and hmac.compare_digest(supplied, expected)
 
 
+def _reuse_window() -> timedelta:
+    """How long a finished benchmark stands in for an identical new one.
+
+    Zero (or negative) disables reuse entirely, which is the escape hatch if a
+    demo ever needs every click to generate afresh.
+    """
+    return timedelta(hours=float(getattr(settings, "OUTREACH_REUSE_HOURS", 24) or 0))
+
+
+def _host(url: str) -> str:
+    """Comparison key for "same company". The benchmark only ever crawls the
+    homepage (OUTREACH_MAX_PAGES = 1) and fires domain-level buyer prompts, so
+    two URLs with the same host produce the same report by construction."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _reusable_benchmark(url: str) -> AnalysisRun | None:
+    """The most recent finished benchmark for this domain inside the window.
+
+    Every generated benchmark costs ~18 search-enabled answer-engine calls, and
+    this endpoint is hand-driven: the same person re-running the same domain
+    several times in a morning was paying full price for a report that cannot
+    have changed. What answer engines say about a company moves over days, not
+    minutes, so serving the stored report back is the same answer for free.
+
+    Deliberately matched in Python rather than with a LIKE on the URL: hosts need
+    normalising (scheme, www, trailing slash) and the window is small. Streamed
+    with ``iterator`` rather than sliced to a fixed count — a slice would have
+    silently stopped reusing anything once the window held more runs than the
+    limit, with no signal that it had stopped working.
+    """
+    window = _reuse_window()
+    if window <= timedelta(0):
+        return None
+    host = _host(url)
+    if not host:
+        return None
+    recent = AnalysisRun.objects.filter(
+        run_type=AnalysisRun.RunType.OUTREACH,
+        status=AnalysisRun.Status.COMPLETE,
+        created_at__gte=timezone.now() - window,
+        # A run built from caller-pinned prompts answers a narrower question
+        # than "what do buyers ask about this domain". Serving it to a request
+        # that pinned nothing would hand back a report measuring a question the
+        # caller never asked. The reverse case (this request pins prompts) is
+        # refused by the caller.
+        onboarding_prompts=[],
+    ).order_by("-created_at")
+    for run in recent.iterator(chunk_size=200):
+        # An empty report is a "complete" run that produced nothing usable
+        # (the credit-exhaustion case); reusing it would cache a bad answer.
+        if run.outreach_report and _host(run.url) == host:
+            return run
+    return None
+
+
 def _serialize(run: AnalysisRun) -> dict:
     return {
         "slug": run.slug,
@@ -101,11 +164,18 @@ class OutreachBenchmarkCreateView(APIView):
             return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
 
         prompts = request.data.get("prompts")
-        pinned = (
-            [str(p).strip() for p in prompts if str(p).strip()][:12]
-            if isinstance(prompts, list)
-            else []
-        )
+        pinned = [str(p).strip() for p in prompts if str(p).strip()][:12] if isinstance(prompts, list) else []
+
+        # Serve a recent identical benchmark instead of buying it twice. Skipped
+        # when the caller pinned their own prompts (a different question, so a
+        # different report) or explicitly asked for a fresh run. 200, not 201:
+        # nothing was created.
+        force = str(request.data.get("force") or "").strip().lower() in {"1", "true", "yes"}
+        if not pinned and not force:
+            cached = _reusable_benchmark(url)
+            if cached is not None:
+                logger.info("outreach: reusing benchmark %s for %s", cached.slug, url)
+                return Response(_serialize(cached), status=status.HTTP_200_OK)
 
         run = AnalysisRun.objects.create(
             url=url,

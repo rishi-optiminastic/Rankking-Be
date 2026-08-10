@@ -1111,6 +1111,13 @@ def ask_answer_engines(
     the caller records as "no answer" rather than silently substituting another
     model's response under the wrong label.
 
+    Note for callers weighing cost: the engine is asked the buyer question ALONE.
+    The brand is never part of the query — it is matched against the reply
+    afterwards — so the answer to "best tools for X" is the same text whoever
+    asked. That is what makes the reply cacheable across brands; see
+    ``prompt_tracker.fire_prompt_across_engines(cache_ttl=...)``, which owns that
+    cache because it lives in the Django app and this module stays framework-free.
+
     Returns: {"gpt": {"text": ..., "citations": [...]}, ...}
     """
     if not is_available() or not _get_openrouter_key():
