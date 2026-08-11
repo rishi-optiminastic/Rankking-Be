@@ -512,7 +512,23 @@ def _crawl_site_via_crawlee(
             _populate_from_html(result, html, page_url)
         return result
 
-    results = [r for r in (_to_result(p) for p in pages) if r is not None]
+    # Same-host only. The crawl starts at base_url and follows same-site links,
+    # so any foreign-host page here is leaked state, not a discovery — and
+    # promoting one to "homepage" below would score the WRONG SITE and put the
+    # wrong brand on the report. Keeping only the requested host makes that
+    # impossible regardless of where the pages came from.
+    def _host(u: str) -> str:
+        return (urlparse(u).hostname or "").lower().removeprefix("www.")
+
+    base_host = _host(base_url)
+    same_host = [p for p in pages if _host((p.get("url") or "").strip()) == base_host]
+    dropped = len(pages) - len(same_host)
+    if dropped:
+        logger.warning(
+            "Crawlee returned %d page(s) from other hosts for %s; dropped them", dropped, base_url
+        )
+
+    results = [r for r in (_to_result(p) for p in same_host) if r is not None]
     if not results:
         return None
 

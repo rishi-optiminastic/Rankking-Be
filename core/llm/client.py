@@ -492,6 +492,7 @@ def ask_llm(
     response_format: dict | None = None,
     cache: bool = False,
     cache_org=None,
+    cache_scope: str = "",
 ) -> str:
     """
     Send a prompt to an LLM via OpenRouter, or direct Gemini as fallback.
@@ -506,14 +507,23 @@ def ask_llm(
                        no hot path silently replays a cached answer.
       cache_org:       Organization the prompt belongs to -- scopes the cache so two
                        brands can never share an entry. Pass it whenever it is known.
+      cache_scope:     extra cache partition (e.g. the brand's domain) for callers with
+                       no Organization. Without it, org-less entries share one global
+                       bucket, and the semantic match can cross brands: a benchmark's
+                       prompt-generation request is mostly fixed template, so two
+                       different domains' requests sit above the similarity floor —
+                       which is how one company's report got another's buyer prompts.
+                       Purely a cache partition: routing, logging and spend see the
+                       unmodified ``purpose``.
     """
     cache_prompt = _cache_prompt_key(prompt, system)
     model_key = _cache_model_key(preferred_provider, tier, temperature, max_tokens)
+    cache_purpose = f"{purpose}#{cache_scope}" if cache_scope else purpose
 
     if cache:
         from core.llm import cache_port
 
-        hit = cache_port.lookup(cache_prompt, purpose=purpose, model_key=model_key, org=cache_org)
+        hit = cache_port.lookup(cache_prompt, purpose=cache_purpose, model_key=model_key, org=cache_org)
         if hit is not None:
             return hit
 
@@ -531,7 +541,7 @@ def ask_llm(
     if cache and text:
         from core.llm import cache_port
 
-        cache_port.store(cache_prompt, text, purpose=purpose, model_key=model_key, org=cache_org)
+        cache_port.store(cache_prompt, text, purpose=cache_purpose, model_key=model_key, org=cache_org)
     return text
 
 

@@ -605,6 +605,13 @@ def generate_brand_prompts(
         brand_name=brand_name,
     )
 
+    # Scope the cache to this brand's domain. Prompt generation is mostly fixed
+    # template, so without a per-domain partition the SEMANTIC lookup crosses
+    # brands: two different domains' requests embed above the similarity floor,
+    # and one company's benchmark inherits another's buyer prompts verbatim
+    # (observed in prod: sees.ai served signalor.ai's prompts at 0.987).
+    cache_host = (urlparse(brand_url).hostname or brand_url or "").lower().removeprefix("www.")
+
     result = ask_structured(
         prompt,
         PromptList,
@@ -614,6 +621,7 @@ def generate_brand_prompts(
         system=brand_card or None,
         cache=True,
         cache_org=cache_org,
+        cache_scope=cache_host,
     )
     if result is not None:
         cleaned = _drop_branded([str(p).strip() for p in result.root if str(p).strip()], brand_name)

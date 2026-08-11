@@ -158,13 +158,15 @@ def ask_structured(
     repair: bool = True,
     cache: bool = False,
     cache_org=None,
+    cache_scope: str = "",
 ) -> T | None:
     """Ask for a single JSON object and return a validated ``schema`` instance,
     or ``None`` on failure (after one repair attempt). Fail-soft by design.
 
-    ``cache``/``cache_org`` opt in to the semantic response cache (Epic 7); the raw LLM
-    text is what gets cached, so a hit is still validated through ``schema``. The repair
-    round-trip is never cached -- it exists precisely because the first answer was bad.
+    ``cache``/``cache_org``/``cache_scope`` opt in to the semantic response cache
+    (Epic 7); the raw LLM text is what gets cached, so a hit is still validated through
+    ``schema``. The repair round-trip is never cached -- it exists precisely because
+    the first answer was bad.
     """
     is_object = _is_object_schema(schema)
     rf = _JSON_OBJECT if (_hint_enabled() and is_object) else None
@@ -180,6 +182,7 @@ def ask_structured(
         response_format=rf,
         cache=cache,
         cache_org=cache_org,
+        cache_scope=cache_scope,
     )
     obj, err = _validate_one(schema, raw)
     if obj is not None:

@@ -87,14 +87,28 @@ def crawl(url: str, limit: int = DEFAULT_LIMIT, timeout: int = DEFAULT_TIMEOUT) 
 
 
 async def _crawl_async(url: str, limit: int, timeout: int) -> list[dict]:
+    import uuid
+
     from crawlee.crawlers import BeautifulSoupCrawler, BeautifulSoupCrawlingContext
     from crawlee.storage_clients import MemoryStorageClient
+    from crawlee.storages import RequestQueue
 
     pages: list[dict] = []
 
+    # A uniquely named queue per crawl, NOT Crawlee's default. The default queue
+    # resolves through a process-global service locator, so in a long-lived
+    # Celery worker consecutive crawls shared one queue: a URL crawled for one
+    # run was "already handled" for the next (0-page crawls), and links left
+    # pending when a run hit its request cap were drained by the NEXT run —
+    # which is how a sees.ai benchmark crawled signalor.ai's pages and shipped
+    # a report with the wrong brand on it.
+    storage = MemoryStorageClient()
+    queue = await RequestQueue.open(name=f"crawl-{uuid.uuid4().hex}", storage_client=storage)
+
     crawler = BeautifulSoupCrawler(
         max_requests_per_crawl=max(1, int(limit)),
-        storage_client=MemoryStorageClient(),
+        storage_client=storage,
+        request_manager=queue,
     )
 
     @crawler.router.default_handler
@@ -121,6 +135,13 @@ async def _crawl_async(url: str, limit: int, timeout: int) -> list[dict]:
         await asyncio.wait_for(crawler.run([url]), timeout=timeout)
     except TimeoutError:
         logger.warning("Crawlee crawl timed out after %ss for %s (%d pages so far)", timeout, url, len(pages))
+    finally:
+        # The queue is in-memory, but drop it anyway so the service locator's
+        # name registry in this process cannot accumulate one entry per crawl.
+        try:
+            await queue.drop()
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            pass
 
     logger.info("Crawlee crawl finished for %s: %d pages", url, len(pages))
     return pages
