@@ -42,6 +42,14 @@ class PromptTrack(models.Model):
     semantic_score = models.FloatField(default=0.0)  # Factor 4 — supplementary
     third_party_score = models.FloatField(default=0.0)  # Factor 5 — supplementary
 
+    # Estimated average monthly Google searches for `prompt_text`, via DataForSEO.
+    # NULL means "never looked up" (or not eligible for lookup); 0 means Google
+    # was asked and reported no measurable demand, which is the common answer for
+    # conversational prompts. The two must stay distinguishable — the dashboard
+    # shows a dash for the former and a real zero for the latter.
+    search_volume = models.IntegerField(null=True, blank=True)
+    search_volume_checked_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     # Soft-delete so that deleting a prompt does NOT free a plan-limit slot.
     # Active (visible) prompts are those with deleted_at IS NULL; all rows

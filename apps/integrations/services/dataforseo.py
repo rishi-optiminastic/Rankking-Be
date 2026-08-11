@@ -122,6 +122,68 @@ def fetch_domain_metrics(domains: Iterable[str]) -> dict[str, dict]:
     return out
 
 
+# Google Ads Keyword Planner rejects any term over 80 characters or 10 words,
+# and DataForSEO passes that rejection straight through. Tracked prompts are
+# conversational sentences, so a good share of them fail this check — they are
+# filtered out before the call rather than costing a task that errors.
+KEYWORD_MAX_CHARS = 80
+KEYWORD_MAX_WORDS = 10
+# Per-task keyword ceiling for the Google Ads endpoint.
+KEYWORD_BATCH_SIZE = 1000
+
+
+def is_volume_eligible(keyword: str) -> bool:
+    """True when Google Ads will accept ``keyword`` for a search-volume lookup."""
+    text = (keyword or "").strip()
+    if not text:
+        return False
+    return len(text) <= KEYWORD_MAX_CHARS and len(text.split()) <= KEYWORD_MAX_WORDS
+
+
+def _result_rows(body: dict) -> list[dict]:
+    """Flatten tasks -> result for endpoints whose result IS the row list.
+
+    Keywords Data returns rows directly under ``result``, unlike the Labs
+    endpoints that nest them one level deeper under ``items``.
+    """
+    rows: list[dict] = []
+    for task in body.get("tasks") or []:
+        for row in task.get("result") or []:
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def fetch_search_volume(keywords: Iterable[str], *, location_code: int = 2840) -> dict[str, int]:
+    """
+    DataForSEO Keywords Data — Google Ads Search Volume.
+
+    Returns ``{keyword_lower: average monthly searches}`` for every term Google
+    returned a figure for. Terms Google has no data on are returned as 0, which
+    is a real answer ("nobody searches this"), distinct from a term that was
+    never looked up and so is absent from the mapping.
+
+    Ineligible terms (see ``is_volume_eligible``) are skipped, not sent.
+    """
+    eligible = sorted({k.strip().lower() for k in keywords if is_volume_eligible(k)})
+    if not eligible:
+        return {}
+
+    out: dict[str, int] = {}
+    for start in range(0, len(eligible), KEYWORD_BATCH_SIZE):
+        batch = eligible[start : start + KEYWORD_BATCH_SIZE]
+        body = _post(
+            "/keywords_data/google_ads/search_volume/live",
+            [{"keywords": batch, "location_code": location_code, "language_code": "en"}],
+        )
+        for row in _result_rows(body):
+            term = (row.get("keyword") or "").strip().lower()
+            if not term:
+                continue
+            out[term] = int(row.get("search_volume") or 0)
+    return out
+
+
 def _normalize_target(domain: str) -> str:
     """Strip scheme, www., trailing slash. DataForSEO Labs expects bare domain."""
     d = (domain or "").strip().lower()

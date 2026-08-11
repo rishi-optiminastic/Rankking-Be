@@ -99,6 +99,9 @@ class PromptTrackSerializer(serializers.ModelSerializer):
             "ranking_label",
             "total_runs",
             "mentions",
+            # Model field, not a method: NULL travels to the client as null so
+            # the dashboard can tell "not looked up" from a measured zero.
+            "search_volume",
             # 5-factor scores
             "factor_authority",
             "factor_content_quality",

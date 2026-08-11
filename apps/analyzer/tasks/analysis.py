@@ -201,6 +201,27 @@ def _save_probes_and_tracks(
         except Exception as exc:
             logger.warning("PromptTrack persist failed for run %d: %s", run.id, exc)
 
+    _kickoff_prompt_volume(run.id)
+
+
+def _kickoff_prompt_volume(run_id: int) -> None:
+    """Queue the DataForSEO search-volume backfill for this run's prompts.
+
+    Off the pipeline deliberately: it is a paid third-party call that nothing
+    downstream reads, so it must not add latency to an analysis or fail one.
+    """
+    from core import queue
+
+    try:
+        if queue.is_eager():
+            from apps.analyzer.services.prompt_volume import backfill_run_volumes
+
+            backfill_run_volumes(run_id)
+        else:
+            queue.send(queue.PROMPT_VOLUME, run_id)
+    except Exception as exc:
+        logger.warning("Prompt volume kickoff failed for run %d: %s", run_id, exc)
+
 
 def _run_partial_analysis(run: AnalysisRun, crawl):
     """

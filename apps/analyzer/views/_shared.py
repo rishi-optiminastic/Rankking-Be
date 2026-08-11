@@ -199,6 +199,15 @@ def _fire_and_save_prompt(track: PromptTrack, brand_name: str, brand_url: str):
             sync_geo_signal_tasks(track.analysis_run)
         except Exception:
             logger.exception("PromptTrack #%d: GEO task resync failed", track.pk)
+
+        # Price the new prompt's search demand. Already on a background thread,
+        # and the service is TTL-guarded, so this costs at most one term.
+        try:
+            from ..services.prompt_volume import backfill_run_volumes
+
+            backfill_run_volumes(track.analysis_run_id)
+        except Exception:
+            logger.exception("PromptTrack #%d: search volume lookup failed", track.pk)
     except Exception as exc:
         logger.warning("PromptTrack #%d fire failed: %s", track.pk, exc)
 

@@ -70,6 +70,25 @@ def run_analysis_task(self, run_id: int) -> None:
         # No re-raise → no Celery retry.
 
 
+@analysis_app.task(name="analyzer.backfill_prompt_volume", bind=True)
+def backfill_prompt_volume_task(self, run_id: int) -> None:
+    """Fill in DataForSEO search volume for a run's tracked prompts.
+
+    Unlike its siblings this one IS idempotent — the service re-checks a TTL
+    before spending anything — but it still swallows its exception, because a
+    missing Volume column must never mark an otherwise good analysis as failed.
+    """
+    from django.db import close_old_connections
+
+    from apps.analyzer.services.prompt_volume import backfill_run_volumes
+
+    close_old_connections()
+    try:
+        backfill_run_volumes(run_id)
+    except Exception as exc:
+        logger.warning("prompt volume backfill failed for run %d: %s", run_id, exc)
+
+
 @analysis_app.task(name="analyzer.run_outreach_benchmark", bind=True)
 def run_outreach_benchmark_task(self, run_id: int) -> None:
     """Build the sales outreach benchmark for ``run_id`` on a worker.

@@ -1130,7 +1130,10 @@ def _discover_competitors_llm(
         # nothing is correct; asking the model anyway produces invented companies,
         # which is what this pipeline used to ship whenever the search failed.
         if not web_candidates:
-            logger.error(
+            # WARNING, not ERROR: this is the designed outcome, not a fault. Logging
+            # it at error level filed a Sentry issue every time the pipeline
+            # correctly refused to guess, which buries the failures that are real.
+            logger.warning(
                 "Competitor discovery for %s: no live search results — returning no competitors "
                 "rather than an ungrounded guess",
                 brand_name,

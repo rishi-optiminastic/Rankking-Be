@@ -23,6 +23,16 @@ from . import pr_format
 
 logger = logging.getLogger("apps")
 
+
+class NoRepositorySelected(Exception):
+    """The install granted several repos and none was chosen.
+
+    A distinct type so the job runner can tell "the user has not finished
+    setting this up" apart from "something broke". The first is expected and
+    logs at warning; the second is a real error worth a Sentry issue.
+    """
+
+
 # Re-profile the repo if the cached profile is older than this.
 _PROFILE_TTL = timezone.timedelta(hours=12)
 
@@ -218,7 +228,7 @@ def open_fix_pr(job_id: int) -> None:
             # Left empty on purpose when the install granted several repos and
             # none clearly matched the brand's domain. Failing here is correct:
             # guessing would open a PR on an unrelated repository.
-            raise ValueError(
+            raise NoRepositorySelected(
                 "No repository selected for this brand. Choose which of the "
                 "connected repositories SignalorAI should open PRs against."
             )
@@ -307,6 +317,14 @@ def open_fix_pr(job_id: int) -> None:
         )
         logger.info("FixJob %s opened PR #%s on %s", job_id, job.pr_number, installation.repo_full_name)
 
+    except NoRepositorySelected as exc:
+        # A configuration state the user owns and the UI already explains, not a
+        # system fault — logging it at error level filed a Sentry issue for a
+        # working product telling someone to pick a repo.
+        logger.warning("FixJob %s needs a repository: %s", job_id, exc)
+        job.status = GithubFixJob.Status.FAILED
+        job.error_message = str(exc)[:1000]
+        job.save(update_fields=["status", "error_message", "updated_at"])
     except Exception as exc:  # noqa: BLE001
         logger.error("FixJob %s failed: %s", job_id, exc)
         job.status = GithubFixJob.Status.FAILED
