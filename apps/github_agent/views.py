@@ -621,13 +621,26 @@ class GithubJobsView(APIView):
         run = _get_run(slug)
         if not run:
             return Response({"error": "Run not found."}, status=status.HTTP_404_NOT_FOUND)
+        # Reconcile before serializing: the merged/closed transition arrives on
+        # the pull_request webhook, so a deployment whose webhook is unconfigured
+        # or undelivered showed "PR Open" indefinitely for an already-merged PR.
+        from .services.pr_sync import reconcile
+
         if job_id is not None:
-            job = GithubFixJob.objects.filter(analysis_run=run, pk=job_id).first()
+            job = (
+                GithubFixJob.objects.filter(analysis_run=run, pk=job_id)
+                .select_related("installation")
+                .first()
+            )
             if not job:
                 return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
-            return Response(_job_dict(job))
-        jobs = GithubFixJob.objects.filter(analysis_run=run).order_by("-created_at")[:50]
-        return Response({"jobs": [_job_dict(j) for j in jobs]})
+            return Response(_job_dict(reconcile([job])[0]))
+        jobs = list(
+            GithubFixJob.objects.filter(analysis_run=run)
+            .select_related("installation")
+            .order_by("-created_at")[:50]
+        )
+        return Response({"jobs": [_job_dict(j) for j in reconcile(jobs)]})
 
 
 # --------------------------------------------------------------------------- #

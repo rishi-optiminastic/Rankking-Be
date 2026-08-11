@@ -129,6 +129,23 @@ class GithubClient:
             raise ValueError(f"create_pull_request failed (HTTP {resp.status_code}): {resp.text[:300]}")
         return resp.json()
 
+    def get_pull_request(self, number: int) -> dict | None:
+        """One PR's current state, or None when it can't be read.
+
+        Best-effort by contract: the caller reconciles a stored status against
+        this, and a GitHub hiccup must leave the stored value alone rather than
+        break the poll that reads it.
+        """
+        try:
+            resp = self._get(f"/pulls/{number}")
+            if resp.status_code != 200:
+                logger.warning("get_pull_request #%s HTTP %s", number, resp.status_code)
+                return None
+            return resp.json()
+        except Exception:
+            logger.warning("get_pull_request #%s failed for %s", number, self.repo, exc_info=True)
+            return None
+
     def create_issue(self, title: str, body: str, labels: list[str] | None = None) -> dict:
         """Open an issue. Used by the Sentry bridge to file an error as work."""
         payload: dict = {"title": title[:250], "body": body}

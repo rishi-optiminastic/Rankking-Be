@@ -33,6 +33,28 @@ from ._shared import (
 )
 
 
+def answered_filter():
+    """Rows where the engine actually returned an answer.
+
+    ``fire_prompt_across_engines`` records a row for an engine that returned
+    nothing — an API error, a timeout, an exhausted credit balance — with
+    ``response_text=""`` and ``brand_mentioned=False``. Counting those made an
+    engine OUTAGE indistinguishable from an engine that answered and did not
+    mention the brand: the row landed in the denominator as a measured miss, so
+    a run during an outage reported a confident "0% share of voice" instead of
+    "not measured". That is a fabricated finding, and the outreach benchmark
+    already refuses to make it (see ``outreach_benchmark`` and the ``measured``
+    flag it carries all the way to the UI). The dashboard now applies the same
+    rule.
+
+    Returned as a callable rather than a module constant because ``Q`` is
+    imported inside each view here, matching the file's existing style.
+    """
+    from django.db.models import Q
+
+    return ~Q(response_text="")
+
+
 class ShareOfVoiceView(APIView):
     permission_classes = [AllowAny]
 
@@ -55,7 +77,12 @@ class ShareOfVoiceView(APIView):
             # for 10 min so the dashboard's first paint amortizes the work.
             data = []
             for engine in engines:
-                qs = PromptResult.objects.filter(prompt_track__analysis_run=run, engine=engine)
+                # Unanswered rows are excluded from BOTH sides of the ratio: an
+                # engine that never replied has measured nothing, so it can
+                # neither raise nor lower share of voice.
+                qs = PromptResult.objects.filter(prompt_track__analysis_run=run, engine=engine).filter(
+                    answered_filter()
+                )
                 agg = qs.aggregate(
                     total=Count("id"),
                     mentioned=Count("id", filter=Q(brand_mentioned=True)),
@@ -68,6 +95,7 @@ class ShareOfVoiceView(APIView):
 
         data = cached_or_compute(f"sov:{slug}", 600, _compute)
         return Response(ShareOfVoiceSerializer(data, many=True).data)
+
 
 class CitationTrendView(APIView):
     permission_classes = [AllowAny]
@@ -89,7 +117,9 @@ class CitationTrendView(APIView):
             else:
                 allowed = None
 
-            base = PromptResult.objects.filter(prompt_track__analysis_run=run)
+            # Same rule as share of voice: an engine that returned nothing
+            # measured nothing, so it must not read as a miss in the trend.
+            base = PromptResult.objects.filter(prompt_track__analysis_run=run).filter(answered_filter())
             if allowed is not None:
                 base = base.filter(engine__in=allowed)
             qs = (
@@ -119,6 +149,7 @@ class CitationTrendView(APIView):
 
         data = cached_or_compute(f"trend:{slug}", 300, _compute)
         return Response(CitationTrendPointSerializer(data, many=True).data)
+
 
 class AiRecommendationSummaryView(APIView):
     """GET /runs/s/<slug>/ai-recommendation-summary/
@@ -157,7 +188,7 @@ class AiRecommendationSummaryView(APIView):
             base = PromptResult.objects.filter(
                 prompt_track__analysis_run=run,
                 prompt_track__deleted_at__isnull=True,
-            )
+            ).filter(answered_filter())
             if allowed is not None:
                 base = base.filter(engine__in=allowed)
 
@@ -243,6 +274,7 @@ class AiRecommendationSummaryView(APIView):
 
         data = cached_or_compute(f"ai_rec_summary:{slug}", 600, _compute)
         return Response(AiRecommendationSummarySerializer(data).data)
+
 
 class CitationSourcesView(APIView):
     """GET /runs/s/<slug>/citations/ — citation source roll-up per run.
@@ -350,6 +382,7 @@ class CitationSourcesView(APIView):
 
         return Response(cached_or_compute(f"cite:{slug}", 600, _compute))
 
+
 class VisibilitySeriesView(APIView):
     """GET /runs/s/<slug>/visibility-series/?days=30
 
@@ -409,6 +442,7 @@ class VisibilitySeriesView(APIView):
                 "direction": direction,
             }
         )
+
 
 class RankingsView(APIView):
     """GET /runs/s/<slug>/rankings/
@@ -548,6 +582,7 @@ class RankingsView(APIView):
 
         return Response({"your_rank": your_rank, "rows": rows})
 
+
 class ShareOfVoiceCompetitorsView(APIView):
     """GET /runs/s/<slug>/share-of-voice-competitors/
 
@@ -614,6 +649,7 @@ class ShareOfVoiceCompetitorsView(APIView):
             }
         )
 
+
 class CitationGapsView(APIView):
     """GET/PATCH /runs/s/<slug>/citation-gaps/ — the domains cited instead of you.
 
@@ -646,9 +682,7 @@ class CitationGapsView(APIView):
         if err is not None:
             return err
         if run.organization is None:
-            return Response(
-                {"detail": "Run has no organization."}, status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"detail": "Run has no organization."}, status=status.HTTP_400_BAD_REQUEST)
         try:
             return Response(
                 set_status(
@@ -660,6 +694,7 @@ class CitationGapsView(APIView):
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
 
 class CompetitorVisibilityMatrixView(APIView):
     """GET /runs/s/<slug>/competitor-visibility-matrix/
@@ -750,6 +785,7 @@ class CompetitorVisibilityMatrixView(APIView):
             )
 
         return Response({"engines": engines, "rows": rows})
+
 
 class TopSourcesView(APIView):
     """GET /runs/s/<slug>/top-sources/
