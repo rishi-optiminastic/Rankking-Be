@@ -133,9 +133,6 @@ from .competitors import (  # noqa: F401
     CompetitorDetailView,
     CompetitorListCreateView,
 )
-from .projection import (  # noqa: F401
-    ProjectionView,
-)
 from .content import (  # noqa: F401
     AnswerGapFaqView,
     ContentApplyElementView,
@@ -159,6 +156,9 @@ from .misc import (  # noqa: F401
 from .outreach import (  # noqa: F401
     OutreachBenchmarkCreateView,
     OutreachBenchmarkDetailView,
+)
+from .projection import (  # noqa: F401
+    ProjectionView,
 )
 from .prompts import (  # noqa: F401
     CompetitorPromptGenerateView,

@@ -91,6 +91,33 @@ def _slugify(title: str) -> str:
     return slug[:60] or "finding"
 
 
+def _own_pages_only(crawls: list, homepage_url: str) -> list:
+    """Drop any crawled page that is not on the analysed site.
+
+    Last line of defence, at the point where crawl output becomes a customer-
+    visible claim. The LLM reads these pages as fact and describes them
+    faithfully, so a foreign page here does not produce a mistake — it produces
+    a confident, well-written finding about a company the user has never heard
+    of ("Homepage is for Kaizan, not Signalor"). Cheap to check, and it means a
+    future regression anywhere in the crawl stack degrades to fewer findings
+    instead of wrong ones.
+    """
+    from .crawlee_crawl import host_of
+
+    expected = host_of(homepage_url)
+    if not expected:
+        return crawls
+
+    kept = [c for c in crawls if host_of(getattr(c, "url", "") or "") == expected]
+    if len(kept) != len(crawls):
+        logger.error(
+            "site_findings: dropped %d page(s) not on %s before generating findings",
+            len(crawls) - len(kept),
+            expected,
+        )
+    return kept
+
+
 def _page_corpus(crawls: list) -> dict[str, str]:
     """Map url -> normalized page text for every successfully crawled page."""
     corpus: dict[str, str] = {}
@@ -467,6 +494,8 @@ def discover_site_findings(
     from core.llm.structured import ask_structured_list
 
     from .schemas import SiteFinding
+
+    crawls = _own_pages_only(crawls, homepage_url)
 
     corpus = _page_corpus(crawls)
     if not corpus:

@@ -81,6 +81,7 @@ from .views import (
     OutreachBenchmarkCreateView,
     OutreachBenchmarkDetailView,
     OverviewInsightsView,
+    ProjectionView,
     PromptAnswerBlockView,
     PromptBacklinksView,
     PromptCoverageView,
@@ -97,7 +98,6 @@ from .views import (
     QuickActionView,
     # Schema watchtower
     RankAuditDetailView,
-    ProjectionView,
     RankAuditRefreshQueryView,
     # Rank tracker
     RankAuditStartView,

@@ -28,7 +28,13 @@ logger = logging.getLogger("apps")
 # within this window instead of never.
 _TTL = 60
 # Cap per request so one page load can't fan out into dozens of GitHub calls.
+# The TTL is set as a side effect of the check, so successive polls rotate
+# through the remaining jobs rather than re-checking the same first five.
 _MAX_PER_REQUEST = 5
+
+# Statuses whose truth still lives on GitHub. MERGED is terminal — a merge
+# cannot be undone — so it is never spent on an API call.
+_RECONCILABLE = frozenset({GithubFixJob.Status.OPEN, GithubFixJob.Status.CLOSED})
 
 
 def _recently_checked(job_id: int) -> bool:
@@ -59,6 +65,10 @@ def _state_from_github(job: GithubFixJob) -> str | None:
         return GithubFixJob.Status.MERGED
     if pr.get("state") == "closed":
         return GithubFixJob.Status.CLOSED
+    if pr.get("state") == "open":
+        # Explicit, so a job stranded on CLOSED by a missed webhook can come back
+        # when the PR is reopened. Returning None here would leave it stuck.
+        return GithubFixJob.Status.OPEN
     return None
 
 
@@ -72,7 +82,10 @@ def reconcile(jobs: list[GithubFixJob]) -> list[GithubFixJob]:
     for job in jobs:
         if checked >= _MAX_PER_REQUEST:
             break
-        if job.status != GithubFixJob.Status.OPEN or not job.pr_number:
+        # CLOSED is reconcilable too: a PR can be reopened, and a job left on
+        # CLOSED by a missed webhook would otherwise never be revisited. MERGED
+        # is genuinely final and never re-checked.
+        if job.status not in _RECONCILABLE or not job.pr_number:
             continue
         if _recently_checked(job.id):
             continue

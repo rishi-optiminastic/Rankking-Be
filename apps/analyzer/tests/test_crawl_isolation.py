@@ -61,6 +61,72 @@ class ForeignHostPageTests(SimpleTestCase):
         self.assertIsNotNone(crawled)
 
 
+class HostIdentityTests(SimpleTestCase):
+    """One definition of "same site", shared by every layer."""
+
+    def test_www_and_case_and_scheme_are_normalised(self):
+        from apps.analyzer.pipeline.crawlee_crawl import host_of
+
+        for url in ("https://WWW.Sees.ai/faq", "http://sees.ai", "https://sees.ai/"):
+            self.assertEqual(host_of(url), "sees.ai")
+
+    def test_a_different_host_is_a_different_site(self):
+        from apps.analyzer.pipeline.crawlee_crawl import host_of
+
+        self.assertNotEqual(host_of("https://signalor.ai"), host_of("https://kaizan.ai"))
+
+    def test_the_adapter_uses_the_shared_definition(self):
+        """The two crawl layers must not carry separate host implementations —
+        that is how guards drift apart and one of them stops matching."""
+        import inspect
+
+        from apps.analyzer.pipeline import crawler
+
+        source = inspect.getsource(crawler._crawl_site_via_crawlee)
+        self.assertIn("crawlee_crawl.host_of", source)
+
+
+class SiteFindingsGuardTests(SimpleTestCase):
+    """The Kaizan incident: findings must never be generated from another site."""
+
+    class _Crawl:
+        def __init__(self, url, text):
+            self.url = url
+            self.text = text
+            self.ok = True
+
+    def test_foreign_pages_are_dropped_before_findings_are_generated(self):
+        from apps.analyzer.pipeline.site_findings import _own_pages_only
+
+        crawls = [
+            self._Crawl("https://signalor.ai/", "Signalor is a GEO platform"),
+            self._Crawl("https://kaizan.ai/faq/", "Kaizan is an AI platform for Client teams"),
+            self._Crawl("https://kaizan.ai/pricing/", "Kaizan pricing"),
+        ]
+        kept = _own_pages_only(crawls, "https://signalor.ai")
+        self.assertEqual([c.url for c in kept], ["https://signalor.ai/"])
+
+    def test_an_all_foreign_crawl_yields_no_findings_rather_than_wrong_ones(self):
+        from apps.analyzer.pipeline.site_findings import discover_site_findings
+
+        crawls = [self._Crawl("https://kaizan.ai/faq/", "Kaizan is an AI platform")]
+        # No LLM patch needed: the guard must empty the corpus and return before
+        # anything is asked. A network call here would fail the test by itself.
+        self.assertEqual(
+            discover_site_findings(crawls, brand="Signalor", homepage_url="https://signalor.ai"),
+            [],
+        )
+
+    def test_own_pages_survive_untouched(self):
+        from apps.analyzer.pipeline.site_findings import _own_pages_only
+
+        crawls = [
+            self._Crawl("https://signalor.ai/", "home"),
+            self._Crawl("https://www.signalor.ai/pricing", "pricing"),
+        ]
+        self.assertEqual(len(_own_pages_only(crawls, "https://signalor.ai")), 2)
+
+
 class CacheScopeTests(SimpleTestCase):
     """cache_scope must partition lookup and store, and leave routing's purpose alone."""
 

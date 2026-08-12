@@ -762,8 +762,8 @@ class BlogPublishNetworkView(APIView):
         from django.shortcuts import get_object_or_404
         from django.utils import timezone
 
-        from ..models import BlogPost
         from .. import blog_store
+        from ..models import BlogPost
 
         run = get_object_or_404(AnalysisRun, slug=slug)
         data = request.data or {}

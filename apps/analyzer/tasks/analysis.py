@@ -44,6 +44,69 @@ from . import (
 logger = logging.getLogger("apps")
 
 
+def _brand_runs(run: AnalysisRun):
+    """Other analysis runs belonging to the same brand, or None when unknowable.
+
+    Prefers the Organization and falls back to (email, url) for runs created
+    before organizations existed. Outreach benchmarks are excluded outright:
+    they are one-off prospect reports whose prompts must never join a customer's
+    tracked set.
+    """
+    others = AnalysisRun.objects.exclude(pk=run.pk).exclude(run_type=AnalysisRun.RunType.OUTREACH)
+    if run.organization_id:
+        return others.filter(organization_id=run.organization_id)
+    email = (run.email or "").strip().lower()
+    if not email:
+        return None
+    return others.filter(email__iexact=email, url=run.url)
+
+
+def _adopt_brand_prompts(run: AnalysisRun, limit: int) -> dict[str, "PromptTrack"]:
+    """Move this brand's tracked prompts onto ``run``, keeping their identity.
+
+    This is the whole fix, and it is deliberately a MOVE rather than a copy.
+
+    A tracked prompt is a measurement series: its value is that the same
+    question is asked run after run so visibility can be compared over time.
+    The pipeline used to create a brand-new PromptTrack per run, which meant
+    every re-analysis started a fresh series — the tracker showed ten different
+    prompts, each with one run of results and therefore 0% and no trend.
+    Carrying the *text* forward would have fixed the table and left the history
+    just as broken, because the results still hung off a brand-new row.
+
+    Re-pointing the existing rows at the new run keeps the primary key, the
+    original created_at ("tracked since"), and every past PromptResult, so this
+    run's answers append to the series instead of replacing it. It also keeps
+    `run.prompt_tracks` working for the ~15 call sites that read prompts that
+    way, and keeps prompt ids stable for the task→prompt deep links.
+
+    Returns {normalized prompt text: PromptTrack} for the caller to reuse.
+    """
+    from ..models import PromptTrack
+
+    previous = _brand_runs(run)
+    if previous is None:
+        return {}
+
+    adopted: dict[str, PromptTrack] = {}
+    for track in (
+        PromptTrack.objects.filter(analysis_run__in=previous, deleted_at__isnull=True)
+        .order_by("-created_at")
+        .iterator()
+    ):
+        key = (track.prompt_text or "").strip().lower()
+        # Newest-first, so a duplicate seen later is the older copy left behind
+        # by the pre-fix behaviour. Skip it; only one row per question survives.
+        if not key or key in adopted or len(adopted) >= limit:
+            continue
+        adopted[key] = track
+
+    if adopted:
+        PromptTrack.objects.filter(pk__in=[t.pk for t in adopted.values()]).update(analysis_run=run)
+        logger.info("Run %d: adopted %d tracked prompt(s) with their history", run.id, len(adopted))
+    return adopted
+
+
 def _save_probes_and_tracks(
     run: AnalysisRun,
     probes_data: list[dict],
@@ -73,22 +136,30 @@ def _save_probes_and_tracks(
 
     em = (run.email or "").strip().lower()
     limits = get_plan_limits(run.email)
-    allowed_engines = limits["engines"] if is_plan_limits_enforcement_enabled() and em else None
-    if is_plan_limits_enforcement_enabled() and em:
-        cur = PromptTrack.objects.filter(analysis_run__email=em).count()
-        slots = max(0, limits["max_prompts"] - cur)
-        gen_count = min(10, slots)
-    else:
-        gen_count = 10
+    enforce = is_plan_limits_enforcement_enabled() and em
+    allowed_engines = limits["engines"] if enforce else None
+    max_prompts = min(10, limits["max_prompts"]) if enforce else 10
 
     stored = list(run.onboarding_prompts or []) if getattr(run, "onboarding_prompts", None) else []
     stored = [p.strip() for p in stored if isinstance(p, str) and p.strip()]
 
-    if gen_count == 0:
-        brand_prompts = []
-    elif stored:
-        brand_prompts = stored[:gen_count]
-    else:
+    # Adopt first, and unconditionally. The prompts a brand already tracks are
+    # already theirs, so re-measuring them is never something the plan cap may
+    # refuse — the cap governs how many NEW prompts may be created. The old code
+    # counted every PromptTrack ever written for the email (soft-deleted rows
+    # included, duplicates from each past run included) and subtracted that from
+    # the allowance BEFORE deciding anything, so a user at their limit got
+    # gen_count == 0 and an analysis that measured nothing at all.
+    adopted = _adopt_brand_prompts(run, max_prompts)
+    brand_prompts = [track.prompt_text for track in adopted.values()]
+
+    # Only the shortfall is ever created new: a brand already tracking its full
+    # allowance generates nothing, which is what makes the set stable forever.
+    shortfall = max_prompts - len(brand_prompts)
+    fresh: list[str] = []
+    if shortfall > 0 and stored:
+        fresh = stored
+    elif shortfall > 0:
         try:
             from apps.organizations.services.brand_context import build_context
             from apps.organizations.services.retrieval import build_knowledge_block
@@ -100,7 +171,7 @@ def _save_probes_and_tracks(
             kb_query = " ".join(filter(None, [brand_name, industry, "products, services, pricing, audience"]))
             page_content = build_knowledge_block(run, kb_query) or crawl_text
 
-            brand_prompts = generate_brand_prompts(
+            fresh = generate_brand_prompts(
                 brand_name=brand_name,
                 brand_url=brand_url,
                 industry=industry,
@@ -109,14 +180,22 @@ def _save_probes_and_tracks(
                 products=site_pages,
                 location="",
                 country=country,
-                count=gen_count,
+                count=shortfall,
                 brand_card=build_context(run),
                 cache_org=run.organization,
             )
         except Exception as exc:
             logger.warning("AI prompt generation failed for run %d: %s", run.id, exc)
-            brand_prompts = []
-        brand_prompts = brand_prompts[:gen_count]
+            fresh = []
+
+    # Never re-add a question this brand already tracks — that is how the same
+    # prompt ended up on two rows with the history split between them.
+    for text in fresh:
+        cleaned = (text or "").strip()
+        if not cleaned or cleaned.lower() in adopted or len(brand_prompts) >= max_prompts:
+            continue
+        adopted[cleaned.lower()] = None  # reserve the slot; row created below
+        brand_prompts.append(cleaned)
 
     # Fire all prompts in parallel — each prompt hits 4 LLMs + Google + Bing
     # (independent of every other prompt), so a thread pool collapses what was
@@ -162,13 +241,23 @@ def _save_probes_and_tracks(
     # on SQLite, and the writes themselves are fast (no LLM latency).
     for prompt_text, intent, prompt_type, engine_results in processed:
         try:
-            track = PromptTrack.objects.create(
-                analysis_run=run,
-                prompt_text=prompt_text,
-                is_custom=False,
-                intent=intent,
-                prompt_type=prompt_type,
-            )
+            # Reuse the adopted row so this run's answers APPEND to the prompt's
+            # history rather than starting a new series. Creating a row here
+            # unconditionally is what reset every prompt to 0% each run.
+            track = adopted.get((prompt_text or "").strip().lower())
+            if track is None:
+                track = PromptTrack.objects.create(
+                    analysis_run=run,
+                    prompt_text=prompt_text,
+                    is_custom=False,
+                    intent=intent,
+                    prompt_type=prompt_type,
+                )
+            elif (track.intent, track.prompt_type) != (intent, prompt_type):
+                # Re-classified: the taxonomy rules improve over time.
+                track.intent = intent
+                track.prompt_type = prompt_type
+                track.save(update_fields=["intent", "prompt_type"])
             for r in engine_results:
                 persist_prompt_result(track, r, brand_host, rival_hosts)
 

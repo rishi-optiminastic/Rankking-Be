@@ -42,12 +42,27 @@ def _handle_pull_request(payload: dict) -> None:
     if number is None:
         return
 
-    job = (
-        GithubFixJob.objects.filter(pr_number=number)
-        .select_related("analysis_run", "installation")
-        .order_by("-created_at")
-        .first()
+    # Scope to the repository the event came from. PR numbers are per-repo, so
+    # matching on the number ALONE crossed tenants: merging #7 in one customer's
+    # repo could flip a different customer's #7 to merged and fire a re-crawl on
+    # their run. Identity here is (installation, pr_number), never the number.
+    jobs = GithubFixJob.objects.filter(pr_number=number).select_related(
+        "analysis_run", "installation"
     )
+    installation_id = ((payload.get("installation") or {}).get("id")) or None
+    repo_full_name = ((payload.get("repository") or {}).get("full_name") or "").strip()
+
+    if installation_id:
+        jobs = jobs.filter(installation__installation_id=installation_id)
+    elif repo_full_name:
+        jobs = jobs.filter(installation__repo_full_name__iexact=repo_full_name)
+    else:
+        # Unattributable event. Doing nothing is correct: acting on it would mean
+        # guessing which customer it belongs to.
+        logger.warning("github webhook: pull_request #%s has no installation or repo", number)
+        return
+
+    job = jobs.order_by("-created_at").first()
     if not job:
         return
 
@@ -59,6 +74,11 @@ def _handle_pull_request(payload: dict) -> None:
         else:
             job.status = GithubFixJob.Status.CLOSED
             job.save(update_fields=["status", "updated_at"])
+    elif action == "reopened" and job.status == GithubFixJob.Status.CLOSED:
+        # Closed then reopened: it is awaiting a merge again, and leaving it
+        # CLOSED would strand it in a state nothing ever revisits.
+        job.status = GithubFixJob.Status.OPEN
+        job.save(update_fields=["status", "updated_at"])
 
 
 def _handle_installation(payload: dict) -> None:

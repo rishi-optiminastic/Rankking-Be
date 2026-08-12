@@ -54,6 +54,31 @@ class CrawleeError(Exception):
     """Raised when the Crawlee crawl cannot run or yields nothing."""
 
 
+class ForeignHostError(CrawleeError):
+    """A crawl produced pages belonging to a host other than the one requested.
+
+    Never expected. It means crawl state crossed run boundaries, and returning
+    the pages anyway is how one company's site got scored — and reported — as
+    another's. Raising aborts to the direct crawler instead.
+    """
+
+
+def host_of(url: str) -> str:
+    """Comparison key for "same site": lowercase hostname, no ``www.``.
+
+    The single definition of site identity for the crawl layer. Everything that
+    decides whether a page belongs to a crawl uses this, so the answer cannot
+    differ between the producer and its consumers.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        hostname = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    return hostname.removeprefix("www.")
+
+
 def is_configured() -> bool:
     """Crawlee needs no key, so it's available unless explicitly disabled via
     ``SIGNALOR_USE_CRAWLEE`` (defaults on)."""
@@ -94,6 +119,7 @@ async def _crawl_async(url: str, limit: int, timeout: int) -> list[dict]:
     from crawlee.storages import RequestQueue
 
     pages: list[dict] = []
+    foreign: list[str] = []
 
     # A uniquely named queue per crawl, NOT Crawlee's default. The default queue
     # resolves through a process-global service locator, so in a long-lived
@@ -111,8 +137,20 @@ async def _crawl_async(url: str, limit: int, timeout: int) -> list[dict]:
         request_manager=queue,
     )
 
+    expected_host = host_of(url)
+
     @crawler.router.default_handler
     async def _handler(context: BeautifulSoupCrawlingContext) -> None:
+        # Refuse anything that is not the site we were asked to crawl. This is
+        # the innermost guard: a page is rejected at the moment it is produced,
+        # before it can reach any consumer, so no present or future caller has
+        # to remember to filter. Counted, not silently skipped — a nonzero count
+        # means crawl isolation broke and we want the crawl to fail loudly.
+        page_host = host_of(context.request.url)
+        if expected_host and page_host != expected_host:
+            foreign.append(context.request.url)
+            return
+
         # parsed_content is Crawlee's BeautifulSoup; serialising it back to HTML
         # preserves <script type="application/ld+json"> for the schema scorer.
         soup = context.parsed_content
@@ -125,9 +163,11 @@ async def _crawl_async(url: str, limit: int, timeout: int) -> list[dict]:
             }
         )
         # Follow same-site links up to the request cap, minus the ones that are
-        # not pages (see SKIP_URL_PATTERNS).
+        # not pages (see SKIP_URL_PATTERNS). ``strategy`` is explicit rather than
+        # left to the library default: link-following must never be the thing
+        # that widens a crawl to another host.
         try:
-            await context.enqueue_links(exclude=SKIP_URL_PATTERNS)
+            await context.enqueue_links(strategy="same-domain", exclude=SKIP_URL_PATTERNS)
         except Exception as exc:  # noqa: BLE001 - link discovery is best-effort
             logger.debug("crawlee enqueue_links failed for %s: %s", context.request.url, exc)
 
@@ -142,6 +182,18 @@ async def _crawl_async(url: str, limit: int, timeout: int) -> list[dict]:
             await queue.drop()
         except Exception:  # noqa: BLE001 - cleanup is best-effort
             pass
+
+    if foreign:
+        # Isolation has failed somewhere upstream. Fail the crawl rather than
+        # return a partial result: a half-foreign crawl is exactly the input
+        # that produces a confident, wrong finding about the wrong company.
+        logger.error(
+            "Crawlee crawl for %s produced %d page(s) from other hosts (e.g. %s); aborting",
+            url,
+            len(foreign),
+            foreign[0],
+        )
+        raise ForeignHostError(f"crawl for {url} returned pages from another host: {foreign[0]}")
 
     logger.info("Crawlee crawl finished for %s: %d pages", url, len(pages))
     return pages

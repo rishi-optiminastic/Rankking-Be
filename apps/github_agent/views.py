@@ -434,7 +434,20 @@ class GithubStatusView(APIView):
         if not run:
             return Response({"error": "Run not found."}, status=status.HTTP_404_NOT_FOUND)
         inst = _active_installation_for(run)
-        jobs = GithubFixJob.objects.filter(analysis_run=run).order_by("-created_at")[:20]
+        # Reconcile here too, not only on the jobs endpoint. This is the status
+        # the dashboard's fix table reads, and without it an already-merged PR
+        # reported "open" for ever whenever the pull_request webhook was
+        # unconfigured or undelivered. pr_sync throttles itself (once per job
+        # per minute, capped per request), so this stays cheap.
+        from .services.pr_sync import reconcile
+
+        jobs = reconcile(
+            list(
+                GithubFixJob.objects.filter(analysis_run=run)
+                .select_related("installation")
+                .order_by("-created_at")[:20]
+            )
+        )
 
         # AI fixability triage — only when a repo is connected (the label is only
         # actionable then). Cached per run, so this LLM call is rare.

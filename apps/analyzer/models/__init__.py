@@ -21,8 +21,8 @@ from .backlinks import (  # noqa: F401
 )
 from .brand import (  # noqa: F401
     BrandKit,
-    EntityResolutionReport,
     DomainAnalyticsSnapshot,
+    EntityResolutionReport,
     OverviewInsightReport,
 )
 from .citations import (  # noqa: F401
