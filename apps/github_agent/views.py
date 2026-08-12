@@ -154,6 +154,9 @@ def _job_dict(job: GithubFixJob) -> dict:
         "id": job.id,
         "status": job.status,
         "finding_codes": job.finding_codes,
+        # Lets the dashboard bind a PR to the one action it was raised for
+        # rather than to every action sharing its finding code.
+        "recommendation_id": job.recommendation_id,
         "pr_number": job.pr_number,
         "pr_url": job.pr_url,
         "files_changed": job.files_changed,
@@ -503,7 +506,15 @@ class GithubFixView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Dedup: drop codes already covered by an in-flight (pending/running/open) job.
+        raw_rec = request.data.get("recommendation_id")
+        try:
+            recommendation_id = int(raw_rec) if raw_rec not in (None, "") else None
+        except (TypeError, ValueError):
+            recommendation_id = None
+
+        # Dedup on the ACTION, not the finding class. Keyed on the code alone,
+        # one open "geo_prompt_lost" PR blocked every other prompt action from
+        # being fixed at all — they share the code and differ only by target.
         inflight = GithubFixJob.objects.filter(
             analysis_run=run,
             status__in=[
@@ -512,11 +523,18 @@ class GithubFixView(APIView):
                 GithubFixJob.Status.OPEN,
             ],
         )
+        if recommendation_id is not None:
+            inflight = inflight.filter(recommendation_id=recommendation_id)
+        else:
+            # No target named: fall back to the old class-wide rule, so a caller
+            # fixing a whole finding still cannot open two PRs for it.
+            inflight = inflight.filter(recommendation_id__isnull=True)
+
         busy = {c for j in inflight for c in (j.finding_codes or [])}
         fresh = [c for c in codes if c not in busy]
         if not fresh:
             return Response(
-                {"error": "A pull request for these findings is already open."},
+                {"error": "A pull request for this action is already open."},
                 status=status.HTTP_409_CONFLICT,
             )
 
@@ -527,6 +545,7 @@ class GithubFixView(APIView):
                 installation=inst,
                 analysis_run=run,
                 finding_codes=[code],
+                recommendation_id=recommendation_id,
                 score_before=run.composite_score,
                 status=GithubFixJob.Status.PENDING,
             )

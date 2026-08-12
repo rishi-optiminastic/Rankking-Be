@@ -104,6 +104,17 @@ class GithubFixJob(models.Model):
     # Finding codes (from analyzer recommendations) this PR addresses.
     finding_codes = models.JSONField(default=list, blank=True)
 
+    # The specific Recommendation this PR was raised for, when the caller named
+    # one. A finding code is NOT unique on its own: ten "Win the AI query"
+    # actions all carry `geo_prompt_lost` and differ only by which prompt they
+    # target. Keying solely on the code made one PR appear on every one of them,
+    # and made the in-flight dedup refuse to fix the other nine ("a pull request
+    # for these findings is already open"). NULL for older jobs and for callers
+    # that fix a whole finding class, which is why every read falls back to the
+    # code. Recommendations are per-run and so is a job, so within a run this is
+    # both stable and unambiguous.
+    recommendation_id = models.IntegerField(null=True, blank=True, db_index=True)
+
     # Content-edit payload for Content-Optimisation PRs (empty for finding-based
     # fixes). Each entry: {"kind": "text"|"metadata", "url", "field", "original",
     # "new"} — the agent locates the exact source of `original` and replaces it
