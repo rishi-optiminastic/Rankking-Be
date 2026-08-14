@@ -196,7 +196,17 @@ class BrandDomainAuthorityView(APIView):
             return Response(get_for_domain(domain))
         except (InvalidDomain, OpenPageRankNotConfigured, OpenPageRankError) as exc:
             # Authority is a best-effort widget — never 500 the dashboard for it.
-            logger.info("Domain authority unavailable for run %s: %s", slug, exc)
+            #
+            # ``reason`` is why the null payload is null. Without it the card
+            # cannot tell "no provider key is set" (permanent until someone
+            # configures one) from "the upstream just failed" (retry later), so
+            # it told every user "unavailable yet" and implied a wait that would
+            # never end.
+            reason = {
+                InvalidDomain: "invalid_domain",
+                OpenPageRankNotConfigured: "not_configured",
+            }.get(type(exc), "upstream_error")
+            logger.info("Domain authority unavailable for run %s (%s): %s", slug, reason, exc)
             return Response(
                 {
                     "domain": domain,
@@ -206,6 +216,7 @@ class BrandDomainAuthorityView(APIView):
                     "linking_websites": None,
                     "source": None,
                     "fetched_at": None,
+                    "reason": reason,
                 }
             )
 

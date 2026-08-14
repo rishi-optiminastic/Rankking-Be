@@ -37,30 +37,66 @@ from rest_framework.response import Response
 from apps.organizations.models import Organization
 
 
+def _own_org_ids(normalized: str) -> set[int]:
+    return set(Organization.objects.filter(owner_email=normalized).values_list("id", flat=True))
+
+
 def accessible_org_ids(email: str) -> set[int]:
-    """Org ids ``email`` may read or write: their own, plus their agency's brands."""
+    """Org ids ``email`` may READ: their own, plus every agency they belong to.
+
+    Plural agencies, deliberately. This used to consult a single context, which
+    resolved to the caller's OWN agency whenever they had one, so a teammate who
+    also owned an agency account was invited, listed as active in the roster, and
+    still could not see one brand of the agency that invited them.
+    """
     normalized = (email or "").lower().strip()
     if not normalized:
         return set()
 
-    from apps.accounts.agency_utils import agency_org_ids, get_agency_context
+    from apps.accounts.agency_utils import agency_org_ids, get_agency_contexts
 
-    ids = set(Organization.objects.filter(owner_email=normalized).values_list("id", flat=True))
-    context = get_agency_context(normalized)
-    if context:
+    ids = _own_org_ids(normalized)
+    for context in get_agency_contexts(normalized):
         ids.update(agency_org_ids(context.agency_email))
     return ids
 
 
-def resolve_scoped_org(email: str, org_id) -> tuple[Organization | None, Response | None]:
+def writable_org_ids(email: str) -> set[int]:
+    """Org ids ``email`` may MUTATE: their own, plus agencies they ADMINISTER.
+
+    Members are excluded on purpose. The roster legend promises a Member can
+    "View reports and work through assigned actions", so brand-wide write is not
+    theirs to have. An assigned action is authorised by the assignee arm in
+    ``caller_owns_action`` instead, which is exactly the narrower grant.
+    """
+    normalized = (email or "").lower().strip()
+    if not normalized:
+        return set()
+
+    from apps.accounts.agency_utils import agency_org_ids, get_agency_contexts
+
+    ids = _own_org_ids(normalized)
+    for context in get_agency_contexts(normalized):
+        if context.is_admin:
+            ids.update(agency_org_ids(context.agency_email))
+    return ids
+
+
+def resolve_scoped_org(
+    email: str, org_id, *, write: bool = False
+) -> tuple[Organization | None, Response | None]:
     """Return ``(org, error_response)`` for a caller-supplied ``org_id``.
 
     Callers do ``org, err = resolve_scoped_org(...); if err: return err``. When
     ``org_id`` is absent this falls back to the caller's own org, which is what the
     dashboard does on first load.
 
+    Pass ``write=True`` from anything that mutates the brand, so an agency Member
+    reading a report is allowed while the same Member changing that brand is not.
+
     404 rather than 403 for an org outside the caller's scope: a 403 confirms the
-    row exists, which is the enumeration signal we are removing.
+    row exists, which is the enumeration signal we are removing. A Member hitting
+    a write they lack gets the same 404 for the same reason.
     """
     normalized = (email or "").lower().strip()
     if not normalized:
@@ -74,7 +110,8 @@ def resolve_scoped_org(email: str, org_id) -> tuple[Organization | None, Respons
     if org_id:
         if not str(org_id).isdigit():
             return None, not_found
-        if int(org_id) not in accessible_org_ids(normalized):
+        permitted = writable_org_ids(normalized) if write else accessible_org_ids(normalized)
+        if int(org_id) not in permitted:
             return None, not_found
         org = Organization.objects.filter(pk=int(org_id)).first()
         if org is None:
@@ -101,15 +138,16 @@ def caller_owns_run(email: str, run) -> bool:
         return False
     if (run.email or "").lower().strip() == normalized:
         return True
-    return bool(run.organization_id and run.organization_id in accessible_org_ids(normalized))
+    return bool(run.organization_id and run.organization_id in writable_org_ids(normalized))
 
 
 def caller_owns_action(email: str, action) -> bool:
     """Whether ``email`` may mutate ``action``.
 
     True when the task is the caller's own, is assigned to them, or belongs to a
-    brand their agency works on. The agency arm is what keeps a teammate able to
-    complete work assigned to them without widening access to everyone else.
+    brand their agency ADMINISTERS. The assignee arm above is what lets a Member
+    "work through assigned actions" (the roster legend's exact promise) without
+    handing them every other action on the brand.
     """
     normalized = (email or "").lower().strip()
     if not normalized:
@@ -120,4 +158,4 @@ def caller_owns_action(email: str, action) -> bool:
         return True
 
     org_id = getattr(action.analysis_run, "organization_id", None)
-    return bool(org_id and org_id in accessible_org_ids(normalized))
+    return bool(org_id and org_id in writable_org_ids(normalized))

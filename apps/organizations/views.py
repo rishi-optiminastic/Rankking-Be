@@ -161,15 +161,13 @@ class OrganizationListView(APIView):
             )
 
         # Agency teammates work inside the agency owner's brands, so surface the
-        # agency's orgs (not just orgs they own — members own none).
-        from apps.accounts.agency_utils import get_agency_context
+        # agency's orgs ALONGSIDE any the caller owns personally. This used to
+        # substitute the agency's email for the caller's, which both hid a
+        # teammate's own brands and, because the context resolved to their own
+        # agency first, showed an invitee nothing belonging to the team.
+        from apps.accounts.agency_utils import readable_owner_emails
 
-        owner_email = email
-        ctx = get_agency_context(email)
-        if ctx is not None:
-            owner_email = ctx.agency_email
-
-        orgs = Organization.objects.filter(owner_email=owner_email)
+        orgs = Organization.objects.filter(owner_email__in=readable_owner_emails(email))
         return Response(OrganizationSerializer(orgs, many=True).data)
 
 
@@ -210,16 +208,21 @@ class OrganizationDetailView(APIView):
 # enough to read/edit/approve a brand's profile (CLAUDE.md §5.3).
 
 
-def _owned_org(slug: str, email: str):
-    """Resolve the org by slug, scoped to the caller's effective owner_email.
-    Returns the Organization, or None when missing / not owned by the caller."""
+def _owned_org(slug: str, email: str, *, write: bool = False):
+    """Resolve the org by slug, scoped to the brands ``email`` may reach.
+
+    Returns the Organization, or None when missing / out of the caller's scope.
+    ``write=True`` narrows the scope to agencies the caller ADMINISTERS, so an
+    agency Member can read a brand profile without being able to rewrite or
+    approve it. The roster legend's "View reports and work through assigned
+    actions", enforced rather than merely described.
+    """
     if not email:
         return None
-    from apps.accounts.agency_utils import get_agency_context
+    from apps.accounts.agency_utils import readable_owner_emails, writable_owner_emails
 
-    ctx = get_agency_context(email)
-    owner_email = ctx.agency_email if ctx is not None else email
-    return Organization.objects.filter(slug=slug, owner_email=owner_email).first()
+    owners = writable_owner_emails(email) if write else readable_owner_emails(email)
+    return Organization.objects.filter(slug=slug, owner_email__in=owners).first()
 
 
 class BrandProfileView(APIView):
@@ -239,7 +242,7 @@ class BrandProfileView(APIView):
 
     def patch(self, request, slug):
         email = (request.data.get("email") or "").lower().strip()
-        org = _owned_org(slug, email)
+        org = _owned_org(slug, email, write=True)
         if org is None:
             return Response({"error": "Organization not found."}, status=status.HTTP_404_NOT_FOUND)
         profile = BrandProfile.objects.filter(organization=org).first()
@@ -258,7 +261,7 @@ class BrandProfileReviewView(APIView):
 
     def post(self, request, slug):
         email = (request.data.get("email") or "").lower().strip()
-        org = _owned_org(slug, email)
+        org = _owned_org(slug, email, write=True)
         if org is None:
             return Response({"error": "Organization not found."}, status=status.HTTP_404_NOT_FOUND)
 

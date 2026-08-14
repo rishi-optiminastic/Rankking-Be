@@ -138,7 +138,9 @@ class StartAnalysisView(APIView):
         if org_id:
             from ..access import resolve_scoped_org
 
-            _org, org_err = resolve_scoped_org(email, org_id)
+            # write=True: starting a run bills the brand's owner and rewrites its
+            # reports, so an agency Member with read access must not trigger one.
+            _org, org_err = resolve_scoped_org(email, org_id, write=True)
             if org_err:
                 return org_err
 
@@ -709,15 +711,16 @@ class ScheduledAnalysisView(APIView):
     permission_classes = [AllowAny]
 
     @staticmethod
-    def _owned_org(email: str, org_id) -> Organization | None:
+    def _owned_org(email: str, org_id, *, write: bool = False) -> Organization | None:
         """The org ``email`` may act on, or None.
 
         Delegates to ``access.resolve_scoped_org`` so there is one implementation of
         "which orgs may this caller touch" rather than a private copy that drifts.
+        ``write`` separates reading a brand's schedule from enrolling it in one.
         """
         from ..access import resolve_scoped_org
 
-        org, err = resolve_scoped_org(email, org_id)
+        org, err = resolve_scoped_org(email, org_id, write=write)
         return None if err else org
 
     def get(self, request):
@@ -767,7 +770,9 @@ class ScheduledAnalysisView(APIView):
                 {"error": "frequency must be once/weekly/monthly."}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        org = self._owned_org(email, org_id)
+        # Enrolling a brand in recurring analysis spends the owner's quota and
+        # mails them a digest, so this arm is admin-only where the GET above is not.
+        org = self._owned_org(email, org_id, write=True)
         if org is None:
             return Response(
                 {"detail": "Brand not found for this account.", "code": "not_found"},
