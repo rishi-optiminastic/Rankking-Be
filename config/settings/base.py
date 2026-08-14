@@ -390,19 +390,22 @@ TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET", "")
 
 AMPLITUDE_API_KEY = os.getenv("AMPLITUDE_API_KEY", "")
 
-# Drip + transactional emails relay through SendGrid SMTP when configured;
-# otherwise the legacy SMTP_USER/SMTP_PASS path stays active.
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+# Every email leaves through Resend, the same provider the frontend already uses
+# for sign-in OTPs. This was split across two vendors and three code paths
+# (SendGrid's HTTP API for welcome/weekly, SendGrid SMTP for digest/drip/billing/
+# enterprise, Resend for OTPs), so a delivery problem had to be diagnosed three
+# times over. `ResendEmailBackend` adapts django.core.mail onto the same
+# transport, which is why no send_mail/EmailMessage call site needed changing.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-if SENDGRID_API_KEY:
-    EMAIL_HOST = "smtp.sendgrid.net"
-    EMAIL_HOST_USER = "apikey"
-    EMAIL_HOST_PASSWORD = SENDGRID_API_KEY
-else:
-    EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
-    EMAIL_HOST_USER = os.getenv("SMTP_USER", "")
-    EMAIL_HOST_PASSWORD = os.getenv("SMTP_PASS", "")
+EMAIL_BACKEND = "core.email.resend.ResendEmailBackend"
+# Retained: the SMTP settings below are unused by the Resend backend, but a
+# console backend in local dev still reads DEFAULT_FROM_EMAIL, and dropping
+# EMAIL_PORT/EMAIL_USE_TLS would break any operator override that sets
+# EMAIL_BACKEND back to SMTP for a one-off.
+EMAIL_HOST = os.getenv("EMAIL_HOST", "")
+EMAIL_HOST_USER = os.getenv("SMTP_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("SMTP_PASS", "")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
 EMAIL_USE_TLS = True
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "noreply@example.com")

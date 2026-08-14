@@ -1,13 +1,17 @@
-"""Email utilities — digest via Django mail, weekly/welcome via SendGrid Web API."""
-import json
+"""Email utilities. Every send here leaves through Resend (see core.email.resend).
+
+The digest still goes via ``django.core.mail``; that is the same transport now,
+because ``EMAIL_BACKEND`` is ``ResendEmailBackend``.
+"""
+
 import logging
 import os
-import urllib.error
-import urllib.request
 
 from django.conf import settings
 from django.core.mail import send_mail
 from django.template.loader import render_to_string
+
+from core.email.resend import send as resend_send
 
 logger = logging.getLogger("apps")
 
@@ -69,12 +73,9 @@ def _fallback_html(ctx: dict) -> str:
     """
 
 
-# ── SendGrid delivery (welcome + weekly emails) ───────────────────────────────
+# ── Delivery (welcome + weekly emails) ────────────────────────────────────────
 
-_SG_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-_SG_FROM_EMAIL = "hello@signalor.ai"
-_SG_FROM_NAME = "Signalor"
-_SG_ENDPOINT = "https://api.sendgrid.com/v3/mail/send"
+_FROM = "Signalor <hello@signalor.ai>"
 _EMAIL_LOGO_URL = os.getenv(
     "EMAIL_LOGO_URL",
     "https://res.cloudinary.com/dui7h1n3d/image/upload/v1779273045/icon_mitiu2.svg",
@@ -82,38 +83,12 @@ _EMAIL_LOGO_URL = os.getenv(
 
 
 def _sg_send(to_email: str, subject: str, html: str, plain: str) -> bool:
-    """POST to SendGrid v3. Returns True on success."""
-    api_key = os.getenv("SENDGRID_API_KEY", "") or _SG_API_KEY
-    if not api_key:
-        logger.error("SENDGRID_API_KEY not set — email to %s skipped (%r)", to_email, subject)
-        return False
+    """Send one transactional email. Returns True on success.
 
-    payload = {
-        "personalizations": [{"to": [{"email": to_email}]}],
-        "from": {"email": _SG_FROM_EMAIL, "name": _SG_FROM_NAME},
-        "subject": subject,
-        "content": [
-            {"type": "text/plain", "value": plain},
-            {"type": "text/html", "value": html},
-        ],
-    }
-    req = urllib.request.Request(
-        _SG_ENDPOINT,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info("Email sent to %s (status=%s, subject=%r)", to_email, resp.status, subject)
-            return True
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        logger.error("SendGrid HTTP %s to %s (%r): %s", exc.code, to_email, subject, body)
-        return False
-    except Exception:
-        logger.exception("Unexpected error sending to %s (%r)", to_email, subject)
-        return False
+    Kept under its original name so the ten-odd call sites and their tests stay
+    untouched; the body is now Resend rather than a hand-rolled SendGrid POST.
+    """
+    return resend_send(to_email, subject, html=html, plain=plain, from_email=_FROM)
 
 
 def send_welcome_email(to_email: str, first_name: str = "", dashboard_slug: str = "") -> bool:
